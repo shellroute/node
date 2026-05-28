@@ -55,6 +55,12 @@ func (s *proxyHandler) handleTunnel(wr http.ResponseWriter, req *http.Request) {
 
 	conn, err := s.dialer.DialContext(ctx, "tcp", req.RequestURI)
 	if err != nil {
+		// context.Canceled means the client closed before dial completed — not
+		// a tunnel failure. This happens normally when probes verify the CONNECT
+		// path and close immediately after getting 200 OK.
+		if ctx.Err() != nil {
+			return
+		}
 		log.Error().Err(err).Msg("Can't satisfy CONNECT request")
 		http.Error(wr, "Can't satisfy CONNECT request", http.StatusBadGateway)
 		return
