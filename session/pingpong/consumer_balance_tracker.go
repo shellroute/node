@@ -337,14 +337,25 @@ func (cbt *ConsumerBalanceTracker) startJob(chainID int64, id identity.Identity,
 
 func (cbt *ConsumerBalanceTracker) periodicSync(stop <-chan struct{}, chainID int64, id identity.Identity, syncPeriod time.Duration) {
 	for {
+		// If spendable balance is low, sync more frequently to catch top-ups fast.
+		interval := syncPeriod
+		if bal := cbt.GetBalance(chainID, id); bal.Cmp(lowBalanceThreshold) < 0 {
+			interval = 10 * time.Second
+		}
+
 		select {
 		case <-stop:
 			return
-		case <-time.After(syncPeriod):
+		case <-time.After(interval):
 			_ = cbt.ForceBalanceUpdate(chainID, id)
 		}
 	}
 }
+
+// lowBalanceThreshold is 1 MYST in wei. When spendable balance drops below
+// this, the periodic sync switches from the normal interval (1 min) to every
+// 10 seconds so top-ups are picked up quickly.
+var lowBalanceThreshold = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil) // 1e18
 
 func (cbt *ConsumerBalanceTracker) alignWithHermes(chainID int64, id identity.Identity) (*big.Int, *big.Int, error) {
 	var boff backoff.BackOff
