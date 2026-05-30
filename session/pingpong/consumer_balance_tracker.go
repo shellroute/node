@@ -303,13 +303,10 @@ func (cbt *ConsumerBalanceTracker) getUnregisteredChannelBalance(chainID int64, 
 }
 
 func (cbt *ConsumerBalanceTracker) lifetimeBCSync(chainID int64, id identity.Identity) {
-	b, ok := cbt.getBalance(chainID, id)
-	if ok && b.IsOffchain {
-		log.Info().Bool("is_offchain", b.IsOffchain).Msg("skipping external channel top-up tracking")
-		return
-	}
-
-	// 100 years should be close enough to never
+	// Sync periodically for all identity types. Offchain (Pilvytis) identities
+	// previously skipped this entirely, meaning balance was never refreshed from
+	// Hermes during the node's lifetime. After a top-up or limit increase, the
+	// node kept using stale GrandTotalPromised and thought balance was zero.
 	timeout := time.Hour * 24 * 365 * 100
 	cbt.startJob(chainID, id, timeout, cbt.cfg.LongSync.Interval)
 }
