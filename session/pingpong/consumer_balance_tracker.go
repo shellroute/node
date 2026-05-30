@@ -223,6 +223,14 @@ func (cbt *ConsumerBalanceTracker) NeedsForceSync(chainID int64, id identity.Ide
 		return true
 	}
 
+	// Spendable balance near zero — force sync even if offchain cache is fresh.
+	// After a top-up via Pilvytis, BCBalance stays the same (channel capacity)
+	// but GrandTotalPromised is reset on Hermes. Without this check, the node
+	// uses stale GrandTotalPromised and thinks balance is zero for up to 30 min.
+	if v.GetBalance().Cmp(units.SingleGweiInWei()) < 0 {
+		return true
+	}
+
 	return false
 }
 
