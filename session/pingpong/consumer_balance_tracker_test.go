@@ -572,6 +572,87 @@ func (p *mockBlockchainInfoProvider) GetConsumerChannelsHermes(chainID int64, ch
 	return result, nil
 }
 
+func newTestBalanceTracker() *ConsumerBalanceTracker {
+	calc := mockAddressProvider{}
+	mockBCP := mockBlockchainInfoProvider{}
+	return NewConsumerBalanceTracker(
+		eventbus.New(), &mockConsumerBalanceChecker{}, &mockConsumerTotalsStorage{},
+		&mockconsumerInfoGetter{}, &mockTransactor{}, &mockRegistrationStatusProvider{},
+		&calc, &mockBCP, defaultCfg,
+	)
+}
+
+func TestNeedsForceSync_SpendableBalanceNearZero(t *testing.T) {
+	cbt := newTestBalanceTracker()
+	id := identity.FromAddress("0xTestForceSync")
+	chainID := int64(1)
+
+	// BCBalance is high (channel capacity) but spendable balance is zero
+	// because GrandTotalPromised consumed everything.
+	cbt.setBalance(chainID, id, ConsumerBalance{
+		BCBalance:          big.NewInt(5000000000000000000), // 5 MYST
+		BCSettled:          big.NewInt(0),
+		GrandTotalPromised: big.NewInt(5000000000000000000), // 5 MYST spent
+		LastOffchainSync:   time.Now(),                      // synced recently
+		IsOffchain:         true,
+	})
+
+	// Spendable = 5 MYST - (5 MYST - 0) = 0. Must trigger force sync.
+	assert.True(t, cbt.NeedsForceSync(chainID, id),
+		"should need force sync when spendable balance is zero even though BCBalance is high")
+}
+
+func TestNeedsForceSync_HealthyBalance(t *testing.T) {
+	cbt := newTestBalanceTracker()
+	id := identity.FromAddress("0xTestHealthy")
+	chainID := int64(1)
+
+	// Plenty of spendable balance — no sync needed.
+	cbt.setBalance(chainID, id, ConsumerBalance{
+		BCBalance:          big.NewInt(5000000000000000000), // 5 MYST
+		BCSettled:          big.NewInt(0),
+		GrandTotalPromised: big.NewInt(1000000000000000000), // 1 MYST spent
+	})
+
+	// Spendable = 5 - (1 - 0) = 4 MYST. Should NOT force sync.
+	assert.False(t, cbt.NeedsForceSync(chainID, id),
+		"should not need force sync when spendable balance is healthy")
+}
+
+func TestPeriodicSync_FastIntervalWhenLowBalance(t *testing.T) {
+	cbt := newTestBalanceTracker()
+	id := identity.FromAddress("0xTestFastSync")
+	chainID := int64(1)
+
+	// Set low balance — below 1 MYST threshold
+	cbt.setBalance(chainID, id, ConsumerBalance{
+		BCBalance:          big.NewInt(5000000000000000000),
+		BCSettled:          big.NewInt(0),
+		GrandTotalPromised: big.NewInt(4500000000000000000), // spendable = 0.5 MYST
+	})
+
+	bal := cbt.GetBalance(chainID, id)
+	assert.True(t, bal.Cmp(lowBalanceThreshold) < 0,
+		"spendable balance should be below threshold (got %s)", bal.String())
+
+	// Set healthy balance — above 1 MYST threshold
+	cbt.setBalance(chainID, id, ConsumerBalance{
+		BCBalance:          big.NewInt(5000000000000000000),
+		BCSettled:          big.NewInt(0),
+		GrandTotalPromised: big.NewInt(1000000000000000000), // spendable = 4 MYST
+	})
+
+	bal = cbt.GetBalance(chainID, id)
+	assert.True(t, bal.Cmp(lowBalanceThreshold) >= 0,
+		"spendable balance should be above threshold (got %s)", bal.String())
+}
+
+func TestLowBalanceThreshold_Is1MYST(t *testing.T) {
+	oneMYST := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	assert.Equal(t, 0, lowBalanceThreshold.Cmp(oneMYST),
+		"lowBalanceThreshold should be exactly 1 MYST (1e18 wei)")
+}
+
 func (p *mockBlockchainInfoProvider) AddConsumerChannelsHermes(chainID int64, channelAddress common.Address, consumerHermes client.ConsumersHermes) {
 	if p.consumerChannelsHermesMap == nil {
 		p.consumerChannelsHermesMap = map[string]client.ConsumersHermes{}
