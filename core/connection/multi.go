@@ -30,8 +30,9 @@ import (
 )
 
 type multiConnectionManager struct {
-	mu  sync.Mutex
-	cms map[int]Manager
+	mu       sync.Mutex
+	cms      map[int]Manager
+	portLock map[int]*sync.Mutex // per-port lock: serializes connect vs disconnect
 
 	newConnectionManager func() Manager
 }
@@ -39,15 +40,27 @@ type multiConnectionManager struct {
 // NewMultiConnectionManager create a wrapper around connection manager to support multiple connections.
 func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnectionManager {
 	return &multiConnectionManager{
-		cms: make(map[int]Manager),
+		cms:      make(map[int]Manager),
+		portLock: make(map[int]*sync.Mutex),
 
 		newConnectionManager: newConnectionManager,
 	}
 }
 
+// portMu returns the per-port mutex, creating it if needed. Must be called under mcm.mu.
+func (mcm *multiConnectionManager) portMu(port int) *sync.Mutex {
+	mu, ok := mcm.portLock[port]
+	if !ok {
+		mu = &sync.Mutex{}
+		mcm.portLock[port] = mu
+	}
+	return mu
+}
+
 // Connect creates new connection from given consumer to provider, reports error if connection already exists.
 func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
 	mcm.mu.Lock()
+	pmu := mcm.portMu(params.ProxyPort)
 	m, ok := mcm.cms[params.ProxyPort]
 	if !ok {
 		m = mcm.newConnectionManager()
@@ -55,6 +68,9 @@ func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesI
 	}
 	mcm.mu.Unlock()
 
+	// Per-port lock: prevents disconnectAll from removing this manager mid-connect
+	pmu.Lock()
+	defer pmu.Unlock()
 	return m.Connect(consumerID, hermesID, proposalLookup, params)
 }
 
@@ -95,6 +111,7 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 	}
 
 	mcm.mu.Lock()
+	pmu := mcm.portMu(id)
 	m, ok := mcm.cms[id]
 	if ok {
 		delete(mcm.cms, id)
@@ -105,6 +122,9 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 		return nil
 	}
 
+	// Per-port lock: waits for any in-flight Connect to finish
+	pmu.Lock()
+	defer pmu.Unlock()
 	err := m.Disconnect()
 	if errors.Is(err, ErrNoConnection) {
 		return nil
@@ -117,17 +137,24 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 func (mcm *multiConnectionManager) disconnectAll() error {
 	mcm.mu.Lock()
 	old := mcm.cms
+	oldLocks := make(map[int]*sync.Mutex, len(old))
+	for port := range old {
+		oldLocks[port] = mcm.portMu(port)
+	}
 	mcm.cms = make(map[int]Manager)
 	mcm.mu.Unlock()
 
 	var firstErr error
-	for _, m := range old {
+	for port, m := range old {
+		// Per-port lock: waits for any in-flight Connect to finish
+		oldLocks[port].Lock()
 		if err := m.Disconnect(); err != nil && !errors.Is(err, ErrNoConnection) {
 			log.Error().Err(err).Msg("Failed to disconnect active connection")
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
+		oldLocks[port].Unlock()
 	}
 	return firstErr
 }
