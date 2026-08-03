@@ -64,14 +64,26 @@ func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesI
 	m, ok := mcm.cms[params.ProxyPort]
 	if !ok {
 		m = mcm.newConnectionManager()
-		mcm.cms[params.ProxyPort] = m
+		// Don't publish yet — wait for successful connect
 	}
 	mcm.mu.Unlock()
 
 	// Per-port lock: prevents disconnectAll from removing this manager mid-connect
 	pmu.Lock()
 	defer pmu.Unlock()
-	return m.Connect(consumerID, hermesID, proposalLookup, params)
+
+	err := m.Connect(consumerID, hermesID, proposalLookup, params)
+	if err != nil && !ok {
+		// New manager failed to connect — don't register it
+		return err
+	}
+	if !ok {
+		// Connect succeeded — publish the manager
+		mcm.mu.Lock()
+		mcm.cms[params.ProxyPort] = m
+		mcm.mu.Unlock()
+	}
+	return err
 }
 
 // Status queries current status of connection.
@@ -111,28 +123,32 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 	}
 
 	mcm.mu.Lock()
-	pmu := mcm.portMu(id)
+	pmu, hasPmu := mcm.portLock[id]
 	m, ok := mcm.cms[id]
-	if ok {
-		delete(mcm.cms, id)
-	}
 	mcm.mu.Unlock()
 
 	if !ok {
 		return nil
 	}
 
-	// Per-port lock: waits for any in-flight Connect to finish
-	pmu.Lock()
-	err := m.Disconnect()
-	pmu.Unlock()
+	// Acquire port lock first — waits for any in-flight Connect to finish,
+	// then remove from registry to prevent a new Connect from seeing it
+	if hasPmu {
+		pmu.Lock()
+	}
 
-	// Clean up per-port lock to prevent unbounded growth
 	mcm.mu.Lock()
-	if _, stillUsed := mcm.cms[id]; !stillUsed {
+	// Re-check: make sure we're removing the same manager (not a replacement)
+	if current, still := mcm.cms[id]; still && current == m {
+		delete(mcm.cms, id)
 		delete(mcm.portLock, id)
 	}
 	mcm.mu.Unlock()
+
+	err := m.Disconnect()
+	if hasPmu {
+		pmu.Unlock()
+	}
 
 	if errors.Is(err, ErrNoConnection) {
 		return nil
@@ -143,36 +159,43 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 // disconnectAll atomically detaches all managers, then disconnects each
 // outside the lock. Managers added after detach are not affected.
 func (mcm *multiConnectionManager) disconnectAll() error {
+	// Acquire all port locks, then detach the registry. This ensures
+	// no in-flight Connect can publish a manager that we're about to disconnect.
+	mcm.mu.Lock()
+	oldLocks := make(map[int]*sync.Mutex, len(mcm.cms))
+	for port := range mcm.cms {
+		if pmu, ok := mcm.portLock[port]; ok {
+			oldLocks[port] = pmu
+		}
+	}
+	mcm.mu.Unlock()
+
+	// Lock all ports — serializes with any in-flight Connect
+	for _, pmu := range oldLocks {
+		pmu.Lock()
+	}
+
+	// Now detach under the global lock — no Connect can be in flight
 	mcm.mu.Lock()
 	old := mcm.cms
-	oldLocks := make(map[int]*sync.Mutex, len(old))
-	for port := range old {
-		oldLocks[port] = mcm.portMu(port)
-	}
 	mcm.cms = make(map[int]Manager)
+	for port := range old {
+		delete(mcm.portLock, port)
+	}
 	mcm.mu.Unlock()
 
 	var firstErr error
 	for port, m := range old {
-		// Per-port lock: waits for any in-flight Connect to finish
-		oldLocks[port].Lock()
 		if err := m.Disconnect(); err != nil && !errors.Is(err, ErrNoConnection) {
 			log.Error().Err(err).Msg("Failed to disconnect active connection")
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
-		oldLocks[port].Unlock()
-	}
-
-	// Clean up per-port locks for detached ports
-	mcm.mu.Lock()
-	for port := range old {
-		if _, stillUsed := mcm.cms[port]; !stillUsed {
-			delete(mcm.portLock, port)
+		if pmu, ok := oldLocks[port]; ok {
+			pmu.Unlock()
 		}
 	}
-	mcm.mu.Unlock()
 
 	return firstErr
 }
