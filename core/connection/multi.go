@@ -30,9 +30,8 @@ import (
 )
 
 type multiConnectionManager struct {
-	mu       sync.Mutex
-	cms      map[int]Manager
-	portLock map[int]*sync.Mutex // per-port lock: serializes connect vs disconnect
+	mu  sync.Mutex
+	cms map[int]Manager
 
 	newConnectionManager func() Manager
 }
@@ -40,47 +39,30 @@ type multiConnectionManager struct {
 // NewMultiConnectionManager create a wrapper around connection manager to support multiple connections.
 func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnectionManager {
 	return &multiConnectionManager{
-		cms:      make(map[int]Manager),
-		portLock: make(map[int]*sync.Mutex),
-
+		cms:                  make(map[int]Manager),
 		newConnectionManager: newConnectionManager,
 	}
 }
 
-// portMu returns the per-port mutex, creating it if needed. Must be called under mcm.mu.
-func (mcm *multiConnectionManager) portMu(port int) *sync.Mutex {
-	mu, ok := mcm.portLock[port]
-	if !ok {
-		mu = &sync.Mutex{}
-		mcm.portLock[port] = mu
-	}
-	return mu
-}
-
 // Connect creates new connection from given consumer to provider, reports error if connection already exists.
+// The manager is published in the registry before Connect to prevent duplicate creation.
+// On failure, it is removed. Manager.Connect handles concurrent calls internally (ErrAlreadyExists).
 func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
 	mcm.mu.Lock()
-	pmu := mcm.portMu(params.ProxyPort)
-	m, ok := mcm.cms[params.ProxyPort]
-	if !ok {
+	m, existed := mcm.cms[params.ProxyPort]
+	if !existed {
 		m = mcm.newConnectionManager()
-		// Don't publish yet — wait for successful connect
+		mcm.cms[params.ProxyPort] = m
 	}
 	mcm.mu.Unlock()
 
-	// Per-port lock: prevents disconnectAll from removing this manager mid-connect
-	pmu.Lock()
-	defer pmu.Unlock()
-
 	err := m.Connect(consumerID, hermesID, proposalLookup, params)
-	if err != nil && !ok {
-		// New manager failed to connect — don't register it
-		return err
-	}
-	if !ok {
-		// Connect succeeded — publish the manager
+	if err != nil && !existed {
+		// New manager failed — remove from registry if still ours
 		mcm.mu.Lock()
-		mcm.cms[params.ProxyPort] = m
+		if mcm.cms[params.ProxyPort] == m {
+			delete(mcm.cms, params.ProxyPort)
+		}
 		mcm.mu.Unlock()
 	}
 	return err
@@ -123,33 +105,17 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 	}
 
 	mcm.mu.Lock()
-	pmu, hasPmu := mcm.portLock[id]
 	m, ok := mcm.cms[id]
+	if ok {
+		delete(mcm.cms, id)
+	}
 	mcm.mu.Unlock()
 
 	if !ok {
 		return nil
 	}
 
-	// Acquire port lock first — waits for any in-flight Connect to finish,
-	// then remove from registry to prevent a new Connect from seeing it
-	if hasPmu {
-		pmu.Lock()
-	}
-
-	mcm.mu.Lock()
-	// Re-check: make sure we're removing the same manager (not a replacement)
-	if current, still := mcm.cms[id]; still && current == m {
-		delete(mcm.cms, id)
-		delete(mcm.portLock, id)
-	}
-	mcm.mu.Unlock()
-
 	err := m.Disconnect()
-	if hasPmu {
-		pmu.Unlock()
-	}
-
 	if errors.Is(err, ErrNoConnection) {
 		return nil
 	}
@@ -157,47 +123,22 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 }
 
 // disconnectAll atomically detaches all managers, then disconnects each
-// outside the lock. Managers added after detach are not affected.
+// outside the lock. Managers added by concurrent Connect after detach
+// are not affected. All errors are joined.
 func (mcm *multiConnectionManager) disconnectAll() error {
-	// Acquire all port locks, then detach the registry. This ensures
-	// no in-flight Connect can publish a manager that we're about to disconnect.
-	mcm.mu.Lock()
-	oldLocks := make(map[int]*sync.Mutex, len(mcm.cms))
-	for port := range mcm.cms {
-		if pmu, ok := mcm.portLock[port]; ok {
-			oldLocks[port] = pmu
-		}
-	}
-	mcm.mu.Unlock()
-
-	// Lock all ports — serializes with any in-flight Connect
-	for _, pmu := range oldLocks {
-		pmu.Lock()
-	}
-
-	// Now detach under the global lock — no Connect can be in flight
 	mcm.mu.Lock()
 	old := mcm.cms
 	mcm.cms = make(map[int]Manager)
-	for port := range old {
-		delete(mcm.portLock, port)
-	}
 	mcm.mu.Unlock()
 
-	var firstErr error
-	for port, m := range old {
+	var errs []error
+	for _, m := range old {
 		if err := m.Disconnect(); err != nil && !errors.Is(err, ErrNoConnection) {
 			log.Error().Err(err).Msg("Failed to disconnect active connection")
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-		if pmu, ok := oldLocks[port]; ok {
-			pmu.Unlock()
+			errs = append(errs, err)
 		}
 	}
-
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping.

@@ -18,19 +18,27 @@ import (
 type mockManager struct {
 	mu            sync.Mutex
 	connected     bool
+	connectDelay  chan struct{} // if set, Connect blocks until closed
+	connectErr    error        // if set, Connect returns this error
 	disconnectErr error
 	connectCount  atomic.Int32
 	disconnCount  atomic.Int32
 }
 
 func (m *mockManager) Connect(_ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
+	if m.connectDelay != nil {
+		<-m.connectDelay
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.connectCount.Add(1)
+	if m.connectErr != nil {
+		return m.connectErr
+	}
 	if m.connected {
 		return ErrAlreadyExists
 	}
 	m.connected = true
-	m.connectCount.Add(1)
 	return nil
 }
 
@@ -76,7 +84,9 @@ func newTestMulti() (*multiConnectionManager, *[]*mockManager) {
 
 func dummyID() identity.Identity      { return identity.Identity{Address: "0x1"} }
 func dummyHermes() common.Address     { return common.HexToAddress("0x2") }
-func dummyLookup() ProposalLookup     { return func() (*proposal.PricedServiceProposal, error) { return nil, nil } }
+func dummyLookup() ProposalLookup {
+	return func() (*proposal.PricedServiceProposal, error) { return nil, nil }
+}
 func dummyParams(port int) ConnectParams { return ConnectParams{ProxyPort: port} }
 
 func TestRegistryEmptyAfterDisconnect(t *testing.T) {
@@ -110,7 +120,6 @@ func TestSamePortReconnect(t *testing.T) {
 		t.Errorf("expected 2 managers created (original + reconnect), got %d", len(*created))
 	}
 
-	// New manager should be connected
 	s := mcm.Status(100)
 	if s.State != connectionstate.Connected {
 		t.Errorf("expected Connected after reconnect, got %v", s.State)
@@ -137,13 +146,12 @@ func TestBulkDisconnect(t *testing.T) {
 	}
 }
 
-func TestBulkDisconnectPartialFailure(t *testing.T) {
+func TestBulkDisconnectJoinsErrors(t *testing.T) {
 	mcm, created := newTestMulti()
 
 	mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 	mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 
-	// Make second manager fail on disconnect
 	(*created)[1].mu.Lock()
 	(*created)[1].disconnectErr = errors.New("network error")
 	(*created)[1].mu.Unlock()
@@ -167,36 +175,86 @@ func TestDisconnectIgnoresErrNoConnection(t *testing.T) {
 	mcm, _ := newTestMulti()
 
 	mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-
-	// Disconnect twice — second should not error (ErrNoConnection suppressed)
 	mcm.Disconnect(100)
+
 	err := mcm.Disconnect(100) // not in registry anymore
 	if err != nil {
 		t.Errorf("second disconnect should return nil, got: %v", err)
 	}
 }
 
+func TestFailedConnectNotRegistered(t *testing.T) {
+	var created []*mockManager
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &mockManager{connectErr: errors.New("p2p failed")}
+		created = append(created, m)
+		return m
+	})
+
+	err := mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	if err == nil {
+		t.Fatal("expected connect error")
+	}
+
+	mcm.mu.Lock()
+	n := len(mcm.cms)
+	mcm.mu.Unlock()
+
+	if n != 0 {
+		t.Errorf("failed connect should not register manager, got %d", n)
+	}
+}
+
+func TestConcurrentSamePortConnect(t *testing.T) {
+	// Two goroutines connect on the same port. Only one manager should exist.
+	// The second connect gets ErrAlreadyExists (handled by Manager internals).
+	mcm, created := newTestMulti()
+
+	var wg sync.WaitGroup
+	var errs [2]error
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+		}(i)
+	}
+	wg.Wait()
+
+	// One should succeed, one should get ErrAlreadyExists
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Errorf("expected exactly 1 success, got %d (errs: %v, %v)", successes, errs[0], errs[1])
+	}
+
+	// Only one manager in registry
+	mcm.mu.Lock()
+	n := len(mcm.cms)
+	mcm.mu.Unlock()
+	if n != 1 {
+		t.Errorf("expected 1 manager, got %d (created: %d)", n, len(*created))
+	}
+}
+
 func TestConnectRacingBulkDisconnect(t *testing.T) {
 	mcm, _ := newTestMulti()
 
-	// Connect some initial ports
 	for i := 0; i < 10; i++ {
 		mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(i))
 	}
 
 	var wg sync.WaitGroup
-
-	// Bulk disconnect
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		mcm.Disconnect(-1)
 	}()
 
-	// Concurrent connect on new port — ordering is non-deterministic.
-	// If Connect runs first, disconnectAll waits for it then disconnects.
-	// If disconnectAll runs first, Connect creates a fresh manager that survives.
-	// Either way, no panic, no race, no deadlock.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -205,7 +263,7 @@ func TestConnectRacingBulkDisconnect(t *testing.T) {
 
 	wg.Wait()
 
-	// Registry should be in a consistent state (no nil managers, no orphans)
+	// No panic, no race. Registry is in consistent state.
 	mcm.mu.Lock()
 	for port, m := range mcm.cms {
 		if m == nil {
@@ -230,31 +288,21 @@ func TestRepeatedCyclesNoRegistryGrowth(t *testing.T) {
 	if n != 0 {
 		t.Errorf("registry should be empty after 50 connect/disconnect cycles, got %d", n)
 	}
-
-	// Per-port locks should also be cleaned up
-	mcm.mu.Lock()
-	locks := len(mcm.portLock)
-	mcm.mu.Unlock()
-
-	if locks != 0 {
-		t.Errorf("portLock should be empty after cleanup, got %d", locks)
-	}
 }
 
-func TestBulkDisconnectCleansPortLocks(t *testing.T) {
+func TestDisconnectUnknownPortNoLeak(t *testing.T) {
 	mcm, _ := newTestMulti()
 
-	for _, port := range []int{100, 200, 300} {
-		mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(port))
+	// Disconnecting unknown ports should not leak anything
+	for i := 0; i < 100; i++ {
+		mcm.Disconnect(i)
 	}
 
-	mcm.Disconnect(-1)
-
 	mcm.mu.Lock()
-	locks := len(mcm.portLock)
+	n := len(mcm.cms)
 	mcm.mu.Unlock()
 
-	if locks != 0 {
-		t.Errorf("portLock should be empty after bulk disconnect, got %d", locks)
+	if n != 0 {
+		t.Errorf("registry should be empty, got %d", n)
 	}
 }
