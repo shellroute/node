@@ -230,4 +230,31 @@ func TestRepeatedCyclesNoRegistryGrowth(t *testing.T) {
 	if n != 0 {
 		t.Errorf("registry should be empty after 50 connect/disconnect cycles, got %d", n)
 	}
+
+	// Per-port locks should also be cleaned up
+	mcm.mu.Lock()
+	locks := len(mcm.portLock)
+	mcm.mu.Unlock()
+
+	if locks != 0 {
+		t.Errorf("portLock should be empty after cleanup, got %d", locks)
+	}
+}
+
+func TestBulkDisconnectCleansPortLocks(t *testing.T) {
+	mcm, _ := newTestMulti()
+
+	for _, port := range []int{100, 200, 300} {
+		mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(port))
+	}
+
+	mcm.Disconnect(-1)
+
+	mcm.mu.Lock()
+	locks := len(mcm.portLock)
+	mcm.mu.Unlock()
+
+	if locks != 0 {
+		t.Errorf("portLock should be empty after bulk disconnect, got %d", locks)
+	}
 }

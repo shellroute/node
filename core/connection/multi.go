@@ -124,8 +124,16 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 
 	// Per-port lock: waits for any in-flight Connect to finish
 	pmu.Lock()
-	defer pmu.Unlock()
 	err := m.Disconnect()
+	pmu.Unlock()
+
+	// Clean up per-port lock to prevent unbounded growth
+	mcm.mu.Lock()
+	if _, stillUsed := mcm.cms[id]; !stillUsed {
+		delete(mcm.portLock, id)
+	}
+	mcm.mu.Unlock()
+
 	if errors.Is(err, ErrNoConnection) {
 		return nil
 	}
@@ -156,6 +164,16 @@ func (mcm *multiConnectionManager) disconnectAll() error {
 		}
 		oldLocks[port].Unlock()
 	}
+
+	// Clean up per-port locks for detached ports
+	mcm.mu.Lock()
+	for port := range old {
+		if _, stillUsed := mcm.cms[port]; !stillUsed {
+			delete(mcm.portLock, port)
+		}
+	}
+	mcm.mu.Unlock()
+
 	return firstErr
 }
 
