@@ -19,6 +19,7 @@ package connection
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -29,7 +30,7 @@ import (
 )
 
 type multiConnectionManager struct {
-	mu  sync.RWMutex
+	mu  sync.Mutex
 	cms map[int]Manager
 
 	newConnectionManager func() Manager
@@ -46,29 +47,24 @@ func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnec
 
 // Connect creates new connection from given consumer to provider, reports error if connection already exists.
 func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
-	mcm.mu.RLock()
+	mcm.mu.Lock()
 	m, ok := mcm.cms[params.ProxyPort]
-	mcm.mu.RUnlock()
-
 	if !ok {
-		mcm.mu.Lock()
-		m, ok = mcm.cms[params.ProxyPort]
-		if !ok {
-			m = mcm.newConnectionManager()
-			mcm.cms[params.ProxyPort] = m
-		}
-		mcm.mu.Unlock()
+		m = mcm.newConnectionManager()
+		mcm.cms[params.ProxyPort] = m
 	}
+	mcm.mu.Unlock()
 
 	return m.Connect(consumerID, hermesID, proposalLookup, params)
 }
 
 // Status queries current status of connection.
 func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
-	mcm.mu.RLock()
-	defer mcm.mu.RUnlock()
+	mcm.mu.Lock()
+	m, ok := mcm.cms[id]
+	mcm.mu.Unlock()
 
-	if m, ok := mcm.cms[id]; ok {
+	if ok {
 		return m.Status()
 	}
 
@@ -79,10 +75,11 @@ func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
 
 // Stats provides connection statistics information.
 func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
-	mcm.mu.RLock()
-	defer mcm.mu.RUnlock()
+	mcm.mu.Lock()
+	m, ok := mcm.cms[id]
+	mcm.mu.Unlock()
 
-	if m, ok := mcm.cms[id]; ok {
+	if ok {
 		return m.Stats()
 	}
 
@@ -90,32 +87,49 @@ func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 }
 
 // Disconnect closes established connection, reports error if no connection.
+// After disconnect, the manager is removed from the registry.
+// id < 0 disconnects all managers atomically.
 func (mcm *multiConnectionManager) Disconnect(id int) error {
-	mcm.mu.RLock()
-	m, ok := mcm.cms[id]
-	mcm.mu.RUnlock()
-
-	if ok {
-		err := m.Disconnect()
-		return err
+	if id < 0 {
+		return mcm.disconnectAll()
 	}
 
-	if id < 0 {
-		mcm.mu.RLock()
-		managers := make([]Manager, 0, len(mcm.cms))
-		for _, m := range mcm.cms {
-			managers = append(managers, m)
-		}
-		mcm.mu.RUnlock()
+	mcm.mu.Lock()
+	m, ok := mcm.cms[id]
+	if ok {
+		delete(mcm.cms, id)
+	}
+	mcm.mu.Unlock()
 
-		for _, m := range managers {
-			if err := m.Disconnect(); err != nil {
-				log.Error().Err(err).Msg("Failed to disconnect active connection")
+	if !ok {
+		return nil
+	}
+
+	err := m.Disconnect()
+	if errors.Is(err, ErrNoConnection) {
+		return nil
+	}
+	return err
+}
+
+// disconnectAll atomically detaches all managers, then disconnects each
+// outside the lock. Managers added after detach are not affected.
+func (mcm *multiConnectionManager) disconnectAll() error {
+	mcm.mu.Lock()
+	old := mcm.cms
+	mcm.cms = make(map[int]Manager)
+	mcm.mu.Unlock()
+
+	var firstErr error
+	for _, m := range old {
+		if err := m.Disconnect(); err != nil && !errors.Is(err, ErrNoConnection) {
+			log.Error().Err(err).Msg("Failed to disconnect active connection")
+			if firstErr == nil {
+				firstErr = err
 			}
 		}
 	}
-
-	return nil
+	return firstErr
 }
 
 // CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping.
@@ -123,10 +137,11 @@ func (mcm *multiConnectionManager) CheckChannel(context.Context) error { return 
 
 // Reconnect reconnects current session.
 func (mcm *multiConnectionManager) Reconnect(id int) {
-	mcm.mu.RLock()
-	defer mcm.mu.RUnlock()
+	mcm.mu.Lock()
+	m, ok := mcm.cms[id]
+	mcm.mu.Unlock()
 
-	if m, ok := mcm.cms[id]; ok {
+	if ok {
 		m.Reconnect()
 	}
 }
