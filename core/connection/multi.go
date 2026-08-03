@@ -30,8 +30,15 @@ import (
 )
 
 type multiConnectionManager struct {
-	mu  sync.Mutex
-	cms map[int]Manager
+	mu       sync.Mutex
+	cms      map[int]Manager
+	portLock map[int]*sync.Mutex
+
+	// bulkMu serializes individual ops (RLock) vs bulk disconnect (Lock).
+	// DisconnectAll takes a write lock, which blocks until all in-flight
+	// Connect/Disconnect calls release their read locks. This prevents
+	// a connected manager from escaping bulk cleanup.
+	bulkMu sync.RWMutex
 
 	newConnectionManager func() Manager
 }
@@ -40,29 +47,48 @@ type multiConnectionManager struct {
 func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnectionManager {
 	return &multiConnectionManager{
 		cms:                  make(map[int]Manager),
+		portLock:             make(map[int]*sync.Mutex),
 		newConnectionManager: newConnectionManager,
 	}
 }
 
-// Connect creates new connection from given consumer to provider, reports error if connection already exists.
-// The manager is published in the registry before Connect to prevent duplicate creation.
-// On failure, it is removed. Manager.Connect handles concurrent calls internally (ErrAlreadyExists).
+// portMu returns the per-port mutex, creating it if needed. Must be called under mu.
+func (mcm *multiConnectionManager) portMu(port int) *sync.Mutex {
+	mu, ok := mcm.portLock[port]
+	if !ok {
+		mu = &sync.Mutex{}
+		mcm.portLock[port] = mu
+	}
+	return mu
+}
+
+// Connect creates new connection from given consumer to provider.
+// The manager is published only after m.Connect succeeds.
+// Per-port lock prevents two same-port connects from racing.
+// Bulk barrier (bulkMu) ensures DisconnectAll waits for in-flight connects.
 func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
+	mcm.bulkMu.RLock()
+	defer mcm.bulkMu.RUnlock()
+
+	mcm.mu.Lock()
+	pmu := mcm.portMu(params.ProxyPort)
+	mcm.mu.Unlock()
+
+	pmu.Lock()
+	defer pmu.Unlock()
+
+	// Re-check under port lock — another Connect may have published
 	mcm.mu.Lock()
 	m, existed := mcm.cms[params.ProxyPort]
 	if !existed {
 		m = mcm.newConnectionManager()
-		mcm.cms[params.ProxyPort] = m
 	}
 	mcm.mu.Unlock()
 
 	err := m.Connect(consumerID, hermesID, proposalLookup, params)
-	if err != nil && !existed {
-		// New manager failed — remove from registry if still ours
+	if err == nil && !existed {
 		mcm.mu.Lock()
-		if mcm.cms[params.ProxyPort] == m {
-			delete(mcm.cms, params.ProxyPort)
-		}
+		mcm.cms[params.ProxyPort] = m
 		mcm.mu.Unlock()
 	}
 	return err
@@ -96,18 +122,30 @@ func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 	return connectionstate.Statistics{}
 }
 
-// Disconnect closes established connection, reports error if no connection.
-// After disconnect, the manager is removed from the registry.
+// Disconnect closes established connection and removes it from the registry.
 // id < 0 disconnects all managers atomically.
 func (mcm *multiConnectionManager) Disconnect(id int) error {
 	if id < 0 {
 		return mcm.disconnectAll()
 	}
 
+	mcm.bulkMu.RLock()
+	defer mcm.bulkMu.RUnlock()
+
+	mcm.mu.Lock()
+	pmu, hasPmu := mcm.portLock[id]
+	mcm.mu.Unlock()
+
+	if hasPmu {
+		pmu.Lock()
+		defer pmu.Unlock()
+	}
+
 	mcm.mu.Lock()
 	m, ok := mcm.cms[id]
 	if ok {
 		delete(mcm.cms, id)
+		delete(mcm.portLock, id)
 	}
 	mcm.mu.Unlock()
 
@@ -122,13 +160,18 @@ func (mcm *multiConnectionManager) Disconnect(id int) error {
 	return err
 }
 
-// disconnectAll atomically detaches all managers, then disconnects each
-// outside the lock. Managers added by concurrent Connect after detach
-// are not affected. All errors are joined.
+// disconnectAll waits for all in-flight operations via bulkMu, then
+// atomically detaches and disconnects everything. Managers created by
+// concurrent Connect calls after the bulk lock is acquired are not affected
+// because Connect blocks on bulkMu.RLock.
 func (mcm *multiConnectionManager) disconnectAll() error {
+	mcm.bulkMu.Lock()
+	defer mcm.bulkMu.Unlock()
+
 	mcm.mu.Lock()
 	old := mcm.cms
 	mcm.cms = make(map[int]Manager)
+	mcm.portLock = make(map[int]*sync.Mutex)
 	mcm.mu.Unlock()
 
 	var errs []error

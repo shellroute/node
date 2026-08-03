@@ -293,7 +293,6 @@ func TestRepeatedCyclesNoRegistryGrowth(t *testing.T) {
 func TestDisconnectUnknownPortNoLeak(t *testing.T) {
 	mcm, _ := newTestMulti()
 
-	// Disconnecting unknown ports should not leak anything
 	for i := 0; i < 100; i++ {
 		mcm.Disconnect(i)
 	}
@@ -304,5 +303,105 @@ func TestDisconnectUnknownPortNoLeak(t *testing.T) {
 
 	if n != 0 {
 		t.Errorf("registry should be empty, got %d", n)
+	}
+}
+
+// TestBulkDisconnectWaitsForInFlightConnect is the deterministic reproduction
+// of the stale-manager race: Connect blocks, DisconnectAll runs, Connect finishes.
+// Without the bulk barrier, the connected manager escapes cleanup.
+func TestBulkDisconnectWaitsForInFlightConnect(t *testing.T) {
+	connectGate := make(chan struct{})
+	var created []*mockManager
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &mockManager{connectDelay: connectGate}
+		created = append(created, m)
+		return m
+	})
+
+	// Start Connect — blocks on connectGate
+	connectDone := make(chan error, 1)
+	go func() {
+		connectDone <- mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	}()
+
+	// Give Connect time to acquire locks and start m.Connect
+	for {
+		mcm.mu.Lock()
+		_, hasLock := mcm.portLock[100]
+		mcm.mu.Unlock()
+		if hasLock {
+			break
+		}
+	}
+
+	// DisconnectAll should block until Connect finishes
+	bulkDone := make(chan error, 1)
+	go func() {
+		bulkDone <- mcm.Disconnect(-1)
+	}()
+
+	// Unblock Connect
+	close(connectGate)
+	<-connectDone
+
+	// Wait for DisconnectAll to finish
+	<-bulkDone
+
+	// The manager must NOT be in the registry — bulk disconnect cleaned it
+	mcm.mu.Lock()
+	n := len(mcm.cms)
+	mcm.mu.Unlock()
+
+	if n != 0 {
+		t.Errorf("live manager escaped bulk cleanup and is no longer tracked: registry has %d entries", n)
+	}
+
+	// Verify the manager was actually disconnected
+	if created[0].disconnCount.Load() == 0 {
+		t.Error("manager should have been disconnected by bulk cleanup")
+	}
+}
+
+// TestIndividualDisconnectWaitsForConnect verifies single-port disconnect
+// also waits for in-flight Connect before removing.
+func TestIndividualDisconnectWaitsForConnect(t *testing.T) {
+	connectGate := make(chan struct{})
+	var created []*mockManager
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &mockManager{connectDelay: connectGate}
+		created = append(created, m)
+		return m
+	})
+
+	connectDone := make(chan error, 1)
+	go func() {
+		connectDone <- mcm.Connect(dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
+	}()
+
+	// Wait for Connect to be in-flight
+	for {
+		mcm.mu.Lock()
+		_, hasLock := mcm.portLock[200]
+		mcm.mu.Unlock()
+		if hasLock {
+			break
+		}
+	}
+
+	discDone := make(chan error, 1)
+	go func() {
+		discDone <- mcm.Disconnect(200)
+	}()
+
+	close(connectGate)
+	<-connectDone
+	<-discDone
+
+	mcm.mu.Lock()
+	n := len(mcm.cms)
+	mcm.mu.Unlock()
+
+	if n != 0 {
+		t.Errorf("registry should be empty after disconnect waited for connect, got %d", n)
 	}
 }
