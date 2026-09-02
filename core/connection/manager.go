@@ -260,26 +260,36 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	// Create lifetime context — separate from caller's ctx
 	m.ctxLock.Lock()
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	lifetimeCancel := m.cancel // capture directly — avoids stale m.cancel race
 	m.ctxLock.Unlock()
 
 	// Cancel lifetime ctx if caller ctx expires during establishment
-	stopAfterFunc := context.AfterFunc(ctx, func() {
-		m.CancelCurrentOperation()
-	})
+	stopAfterFunc := context.AfterFunc(ctx, lifetimeCancel)
+
+	// Error cleanup — installed immediately after lifetime ctx creation.
+	// Catches failures at ANY stage (proposal, validation, connection, etc.)
+	defer func() {
+		if err != nil {
+			stopAfterFunc()
+			log.Err(err).Msg("Connect failed, disconnecting")
+			m.DisconnectContext(context.Background())
+		}
+	}()
 
 	m.addCleanup(func() error {
 		m.clearIPCache()
 		return nil
 	})
 
-	// Proposal lookup — now cancellable via lifetime ctx
+	// Check ctx before each external stage
 	proposal, err := proposalLookup()
 	if err != nil {
-		stopAfterFunc()
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+		}
 		return fmt.Errorf("failed to lookup proposal: %w", err)
 	}
 	if ctx.Err() != nil {
-		stopAfterFunc()
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
@@ -293,22 +303,16 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 
 	err = m.validator.Validate(m.chainID(), consumerID, prc)
 	if err != nil {
-		stopAfterFunc()
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+		}
 		return err
 	}
 	if ctx.Err() != nil {
-		stopAfterFunc()
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
 	m.statusConnecting(consumerID, hermesID, *proposal)
-	defer func() {
-		if err != nil {
-			stopAfterFunc()
-			log.Err(err).Msg("Connect failed, disconnecting")
-			m.DisconnectContext(context.Background())
-		}
-	}()
 
 	m.connectOptions = ConnectOptions{
 		ConsumerID:     consumerID,
@@ -922,18 +926,24 @@ func (m *connectionManager) DisconnectContext(ctx context.Context) error {
 	log.Info().Msgf("Connection state: %v -> %v", stateWas, connectionstate.Disconnecting)
 	m.publishStateEvent(connectionstate.Disconnecting)
 
-	// Run cleanup (only one caller reaches here per attempt)
-	m.runDisconnectCleanup()
+	// Launch cleanup in goroutine — all callers (including starter) select
+	go func() {
+		m.runDisconnectCleanup()
+		att.err = nil
+		close(att.done)
 
-	att.err = nil
-	close(att.done)
+		m.discoAttemptMu.Lock()
+		m.discoAttempt = nil
+		m.discoAttemptMu.Unlock()
+	}()
 
-	// Clear attempt for next cycle
-	m.discoAttemptMu.Lock()
-	m.discoAttempt = nil
-	m.discoAttemptMu.Unlock()
-
-	return nil
+	// Starter waits same as everyone else
+	select {
+	case <-att.done:
+		return att.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *connectionManager) CheckChannel(ctx context.Context) error {
@@ -951,11 +961,13 @@ func (m *connectionManager) disconnect() {
 
 // runDisconnectCleanup does the actual cleanup work. Called exactly once per attempt.
 func (m *connectionManager) runDisconnectCleanup() {
-	m.ctxLock.Lock()
-	if m.cancel != nil {
-		m.cancel()
+	// Copy cancel under lock, invoke outside — plan invariant 1
+	m.ctxLock.RLock()
+	cancelFn := m.cancel
+	m.ctxLock.RUnlock()
+	if cancelFn != nil {
+		cancelFn()
 	}
-	m.ctxLock.Unlock()
 
 	m.cleanConnection()
 	m.statusNotConnected()
