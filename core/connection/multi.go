@@ -248,7 +248,7 @@ func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
 	mcm.mu.Lock()
 	e, ok := mcm.current[id]
 	mcm.mu.Unlock()
-	if ok {
+	if ok && e.manager != nil {
 		return e.manager.Status()
 	}
 	return connectionstate.Status{State: connectionstate.NotConnected}
@@ -259,7 +259,7 @@ func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 	mcm.mu.Lock()
 	e, ok := mcm.current[id]
 	mcm.mu.Unlock()
-	if ok {
+	if ok && e.manager != nil {
 		return e.manager.Stats()
 	}
 	return connectionstate.Statistics{}
@@ -521,6 +521,9 @@ func (mcm *multiConnectionManager) CheckChannel(ctx context.Context) error { ret
 
 // cancelManager requests non-blocking cancellation on a manager.
 func (mcm *multiConnectionManager) cancelManager(m Manager) {
+	if m == nil {
+		return
+	}
 	type canceller interface {
 		CancelCurrentOperation()
 	}
