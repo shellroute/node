@@ -318,56 +318,26 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 	return nil
 }
 
-// ConnectContext wraps Connect with context cancellation support.
-// If ctx is cancelled during connect, cancels the manager's lifetime context.
+// ConnectContext is the context-aware connect. The coordinator calls this
+// via lifecycleManager type assertion. It delegates to Connect which owns
+// the lifetime context internally. Cancellation is handled via CancelCurrentOperation.
 func (m *connectionManager) ConnectContext(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
-	type result struct{ err error }
-	ch := make(chan result, 1)
-	go func() {
-		ch <- result{m.Connect(consumerID, hermesID, proposalLookup, params)}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.err
-	case <-ctx.Done():
-		m.CancelCurrentOperation()
-		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
-	}
+	// The coordinator owns the ctx select; this runs synchronously in the worker.
+	// CancelCurrentOperation is called by the coordinator on ctx cancel.
+	return m.Connect(consumerID, hermesID, proposalLookup, params)
 }
 
-// DisconnectContext waits for disconnect completion or ctx cancellation.
+// DisconnectContext is the context-aware disconnect. Waits for real completion.
+// The coordinator owns the ctx select; this runs synchronously.
 func (m *connectionManager) DisconnectContext(ctx context.Context) error {
-	type result struct{ err error }
-	ch := make(chan result, 1)
-	go func() {
-		ch <- result{m.Disconnect()}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return m.Disconnect()
 }
 
-// ReconnectContext wraps Reconnect with context and error return.
+// ReconnectContext is the context-aware reconnect with error return.
+// The coordinator owns the ctx select; this runs synchronously.
 func (m *connectionManager) ReconnectContext(ctx context.Context) error {
-	type result struct{}
-	ch := make(chan result, 1)
-	go func() {
-		m.Reconnect()
-		ch <- result{}
-	}()
-
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		m.CancelCurrentOperation()
-		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
-	}
+	m.Reconnect()
+	return nil
 }
 
 func (m *connectionManager) autoReconnect() (err error) {

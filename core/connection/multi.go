@@ -614,9 +614,10 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 		}
 
 		mcm.mu.Lock()
-		close(opDone)
 
 		if e.phase == phaseRetiring {
+			resultErr = fmt.Errorf("%w: %w", ErrConnectionCancelled, ErrLifecycleBusy)
+			close(opDone)
 			mcm.mu.Unlock()
 			mcm.retireEntry(e)
 			return
@@ -625,6 +626,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 		if mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
 			e.phase = phaseActive
 			resultErr = nil
+			close(opDone)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			return
@@ -637,6 +639,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 		e.phase = phaseRetiring
 		mcm.retiring[id] = e
 		resultErr = ErrLifecycleBusy
+		close(opDone)
 		mcm.stateChanged()
 		mcm.mu.Unlock()
 		mcm.retireEntry(e)
