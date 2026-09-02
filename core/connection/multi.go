@@ -66,6 +66,10 @@ type portEntry struct {
 	manager    Manager
 	phase      entryPhase
 
+	// operationDone is closed when the Connect/Reconnect worker finishes.
+	// Cleanup must wait for this before starting Disconnect.
+	operationDone chan struct{}
+
 	// cleanupRunning is true while a Disconnect call is in-flight on the manager.
 	cleanupRunning bool
 	// cleanupDone is closed when cleanup completes. Nil until cleanup starts.
@@ -138,15 +142,14 @@ func (mcm *multiConnectionManager) waitNotify() <-chan struct{} {
 }
 
 // Connect creates a new connection on the given port.
-// Returns ErrLifecycleBusy if reconciliation is active or the port is retiring.
-// The manager worker owns its own lifecycle — on caller cancellation, the caller
-// returns immediately while the worker finalizes (retire/cleanup) asynchronously.
+// The port is reserved atomically before creating the manager. The worker
+// owns finalization — cleanup waits for the operation to finish first.
 func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	// Check eligibility before creating manager (avoids leaked EventBus subscriptions)
+	// Reserve port atomically before creating manager
 	mcm.mu.Lock()
 	if mcm.reconcileRequired {
 		mcm.mu.Unlock()
@@ -160,63 +163,50 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		mcm.mu.Unlock()
 		return ErrAlreadyExists
 	}
-	mcm.mu.Unlock()
-
-	m := mcm.newConnectionManager()
-
-	mcm.mu.Lock()
-	// Re-check after creating manager (race window)
-	if mcm.reconcileRequired {
-		mcm.mu.Unlock()
-		return ErrLifecycleBusy
-	}
-	if _, retiring := mcm.retiring[params.ProxyPort]; retiring {
-		mcm.mu.Unlock()
-		return ErrLifecycleBusy
-	}
-	if _, exists := mcm.current[params.ProxyPort]; exists {
-		mcm.mu.Unlock()
-		return ErrAlreadyExists
-	}
-
-	// operationDone is closed by the worker when Connect completes
-	operationDone := make(chan struct{})
+	// Reserve with nil manager — filled after construction
+	opDone := make(chan struct{})
 	entry := &portEntry{
-		port:       params.ProxyPort,
-		generation: mcm.generation,
-		manager:    m,
-		phase:      phaseConnecting,
+		port:          params.ProxyPort,
+		generation:    mcm.generation,
+		phase:         phaseConnecting,
+		operationDone: opDone,
 	}
 	mcm.current[params.ProxyPort] = entry
 	gen := mcm.generation
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	// Worker owns finalization — caller never blocks on worker completion.
+	// Create manager after reservation is held
+	m := mcm.newConnectionManager()
+	mcm.mu.Lock()
+	entry.manager = m
+	mcm.mu.Unlock()
+
+	// Worker: runs Connect, then finalizes under lock
 	var workerErr error
 	go func() {
-		defer close(operationDone)
 		workerErr = m.Connect(consumerID, hermesID, proposalLookup, params)
 
 		mcm.mu.Lock()
-		e, stillCurrent := mcm.current[params.ProxyPort]
+		// Signal operation finished — cleanup can now proceed
+		close(opDone)
 
 		if entry.phase == phaseRetiring {
-			// Caller cancelled — we're already retired. Start cleanup.
+			// Caller or bulk cancelled — cleanup will be started by retireEntry
 			mcm.mu.Unlock()
-			mcm.retireEntry(entry)
 			return
 		}
 
-		if workerErr == nil && stillCurrent && e == entry && mcm.generation == gen && !mcm.reconcileRequired {
+		if workerErr == nil && mcm.current[params.ProxyPort] == entry &&
+			mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
 			entry.phase = phaseActive
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			return
 		}
 
-		// Stale, superseded, or failed — retire
-		if stillCurrent && e == entry {
+		// Failed, stale, or superseded — retire
+		if mcm.current[params.ProxyPort] == entry {
 			delete(mcm.current, params.ProxyPort)
 		}
 		entry.phase = phaseRetiring
@@ -226,14 +216,13 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		mcm.retireEntry(entry)
 	}()
 
-	// Caller waits for worker completion or ctx cancellation
+	// Caller: wait for worker or ctx cancellation
 	select {
-	case <-operationDone:
+	case <-opDone:
 		return workerErr
 	case <-ctx.Done():
-		// Mark entry as retiring — worker will see this and handle cleanup
 		mcm.mu.Lock()
-		if e, ok := mcm.current[params.ProxyPort]; ok && e == entry {
+		if mcm.current[params.ProxyPort] == entry {
 			delete(mcm.current, params.ProxyPort)
 			entry.phase = phaseRetiring
 			mcm.retiring[params.ProxyPort] = entry
@@ -337,10 +326,23 @@ func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *po
 	}
 }
 
-// retireEntry runs cleanup on an entry's manager. Only one cleanup per entry.
+// retireEntry runs cleanup on an entry's manager. Waits for any in-flight
+// operation (Connect/Reconnect) to finish first. Only one cleanup per entry.
 func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
+	// Wait for the operation to finish before disconnecting
+	if entry.operationDone != nil {
+		<-entry.operationDone
+	}
+
 	mcm.mu.Lock()
 	if entry.cleanupRunning {
+		mcm.mu.Unlock()
+		return
+	}
+	if entry.manager == nil {
+		// Reserved but never filled — nothing to clean
+		delete(mcm.retiring, entry.port)
+		mcm.stateChanged()
 		mcm.mu.Unlock()
 		return
 	}
