@@ -811,6 +811,17 @@ func (m *connectionManager) Cancel() {
 	logDisconnectError(m.Disconnect())
 }
 
+// CancelCurrentOperation cancels any in-flight connect/reconnect without
+// waiting for completion. Safe to call concurrently and repeatedly.
+func (m *connectionManager) CancelCurrentOperation() {
+	m.ctxLock.RLock()
+	cancel := m.cancel
+	m.ctxLock.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (m *connectionManager) Disconnect() error {
 	m.statusLock.Lock()
 	stateWas := m.status.State
