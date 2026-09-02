@@ -180,8 +180,8 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	m := mcm.newConnectionManager()
 	mcm.mu.Lock()
 	entry.manager = m
-	// Check if superseded during factory construction (bulk may have advanced)
-	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired {
+	// Check if superseded during factory construction (bulk/ctx may have advanced)
+	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired || ctx.Err() != nil {
 		entry.phase = phaseRetiring
 		if mcm.current[params.ProxyPort] == entry {
 			delete(mcm.current, params.ProxyPort)
@@ -244,7 +244,13 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		return resultErr
 	case <-ctx.Done():
 		mcm.mu.Lock()
-		if mcm.current[params.ProxyPort] == entry {
+		// Worker may have already completed — check before retiring
+		if entry.phase == phaseActive {
+			// Worker already published success — linearize to success
+			mcm.mu.Unlock()
+			return nil
+		}
+		if mcm.current[params.ProxyPort] == entry && entry.phase == phaseConnecting {
 			delete(mcm.current, params.ProxyPort)
 			entry.phase = phaseRetiring
 			mcm.retiring[params.ProxyPort] = entry
@@ -419,14 +425,26 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	}
 
 	// Start new bulk operation — server-owned goroutine
-	mcm.reconcileRequired = true
-	mcm.generation++
+	// Only advance generation on first reconcile; retries keep the same generation
+	if !mcm.reconcileRequired {
+		mcm.reconcileRequired = true
+		mcm.generation++
+	}
 	gen := mcm.generation
 
+	// Move current entries to retiring
 	for port, e := range mcm.current {
 		e.phase = phaseRetiring
 		mcm.retiring[port] = e
 		delete(mcm.current, port)
+	}
+
+	// Clear prior cleanup errors/state so retireEntry can run again
+	for _, e := range mcm.retiring {
+		if e.cleanupErr != nil && !e.cleanupRunning {
+			e.cleanupErr = nil
+			e.cleanupDone = nil
+		}
 	}
 
 	bulk := &bulkOp{done: make(chan struct{})}
@@ -499,7 +517,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 		}
 		if len(cleanupErrs) > 0 {
 			// End this bulk attempt — keep reconcileRequired, don't advance generation
-			err := fmt.Errorf("bulk cleanup failed: %w", errors.Join(cleanupErrs...))
+			err := fmt.Errorf("%w: bulk cleanup failed: %w", ErrLifecycleBusy, errors.Join(cleanupErrs...))
 			mcm.activeBulk = nil
 			bulk.err = err
 			close(bulk.done)
@@ -529,7 +547,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			}
 
 			sort.Ints(pendingPorts)
-			err := fmt.Errorf("bulk disconnect timeout after %s, pending ports: %v", mcm.BulkTimeout, pendingPorts)
+			err := fmt.Errorf("%w: bulk disconnect timeout after %s, pending ports: %v", ErrLifecycleBusy, mcm.BulkTimeout, pendingPorts)
 			mcm.mu.Lock()
 			mcm.activeBulk = nil
 			bulk.err = err
