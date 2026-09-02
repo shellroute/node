@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -39,38 +40,48 @@ func (m *blockingMultiManager) Disconnect(ctx context.Context, id int) error {
 func (m *blockingMultiManager) CheckChannel(context.Context) error { return nil }
 func (m *blockingMultiManager) Reconnect(context.Context, int) error { return nil }
 
-type noopAPIServer struct{}
+type recordingAPIServer struct {
+	stopCount int
+}
 
-func (n *noopAPIServer) StartServing()          {}
-func (n *noopAPIServer) Wait() error            { return nil }
-func (n *noopAPIServer) Stop()                  {}
-func (n *noopAPIServer) Address() (string, error) { return "", nil }
+func (n *recordingAPIServer) StartServing()            {}
+func (n *recordingAPIServer) Wait() error              { return nil }
+func (n *recordingAPIServer) Stop()                    { n.stopCount++ }
+func (n *recordingAPIServer) Address() (string, error) { return "", nil }
 
-type noopUIServer struct{}
+type recordingUIServer struct {
+	stopCount int
+}
 
-func (n *noopUIServer) Serve()           {}
-func (n *noopUIServer) SwitchUI(string)  {}
-func (n *noopUIServer) Stop()            {}
+func (n *recordingUIServer) Serve()          {}
+func (n *recordingUIServer) SwitchUI(string) {}
+func (n *recordingUIServer) Stop()           { n.stopCount++ }
 
 type noopPublisher struct{}
 
 func (n *noopPublisher) Publish(string, interface{}) {}
 
-type noopSleepNotifier struct{}
+type recordingSleepNotifier struct {
+	stopCount int
+}
 
-func (n *noopSleepNotifier) Start() {}
-func (n *noopSleepNotifier) Stop()  {}
+func (n *recordingSleepNotifier) Start() {}
+func (n *recordingSleepNotifier) Stop()  { n.stopCount++ }
 
 // Unused but needed for compilation
 var _ = proposal.PricedServiceProposal{}
 
-func TestNodeKillBoundedByTimeout(t *testing.T) {
+func TestNodeKillBoundedAndCallsAllStops(t *testing.T) {
 	gate := make(chan struct{})
 	mgr := &blockingMultiManager{gate: gate}
+	api := &recordingAPIServer{}
+	ui := &recordingUIServer{}
+	sleep := &recordingSleepNotifier{}
 
-	node := NewNode(mgr, &noopAPIServer{}, &noopPublisher{}, &noopUIServer{}, &noopSleepNotifier{})
+	node := NewNode(mgr, api, &noopPublisher{}, ui, sleep)
 	node.ShutdownTimeout = 200 * time.Millisecond
 
+	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
 		done <- node.Kill()
@@ -78,25 +89,31 @@ func TestNodeKillBoundedByTimeout(t *testing.T) {
 
 	select {
 	case err := <-done:
-		// Should complete within timeout even though disconnect blocks
+		elapsed := time.Since(start)
+		// Should complete within ~300ms (200ms timeout + margin)
+		if elapsed > 1*time.Second {
+			t.Errorf("Kill took %s, expected < 1s", elapsed)
+		}
+		// Should return deadline error
 		if err == nil {
 			t.Error("expected error from timed-out disconnect")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected DeadlineExceeded, got %v", err)
+		}
+		// All stops must be called even on error
+		if api.stopCount != 1 {
+			t.Errorf("API Stop called %d times, want 1", api.stopCount)
+		}
+		if ui.stopCount != 1 {
+			t.Errorf("UI Stop called %d times, want 1", ui.stopCount)
+		}
+		if sleep.stopCount != 1 {
+			t.Errorf("Sleep Stop called %d times, want 1", sleep.stopCount)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Node.Kill did not return within 2s — shutdown not bounded")
 	}
 
 	close(gate) // unblock for cleanup
-}
-
-func TestNodeKillCallsAllStops(t *testing.T) {
-	mgr := &blockingMultiManager{}
-	api := &noopAPIServer{}
-	node := NewNode(mgr, api, &noopPublisher{}, &noopUIServer{}, &noopSleepNotifier{})
-	node.ShutdownTimeout = 100 * time.Millisecond
-
-	err := node.Kill()
-	if err != nil {
-		t.Errorf("expected nil error for clean disconnect, got %v", err)
-	}
 }

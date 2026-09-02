@@ -357,25 +357,33 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 		mcm.mu.Unlock()
 		return // already started or completed
 	}
-	if entry.manager == nil {
-		// Reserved but never filled — nothing to clean
-		delete(mcm.retiring, entry.port)
-		mcm.stateChanged()
-		mcm.mu.Unlock()
-		return
-	}
 	entry.cleanupRunning = true
 	done := make(chan struct{})
 	entry.cleanupDone = done
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	// Wait for the operation to finish before disconnecting
+	// Wait for the operation (Connect/factory) to finish before disconnecting
 	if entry.operationDone != nil {
 		<-entry.operationDone
 	}
 
-	err := entry.manager.Disconnect()
+	// After operation finished, check if manager was ever created
+	mcm.mu.Lock()
+	m := entry.manager
+	mcm.mu.Unlock()
+	if m == nil {
+		// Factory never completed or entry was a bare reservation — nothing to disconnect
+		mcm.mu.Lock()
+		delete(mcm.retiring, entry.port)
+		entry.cleanupRunning = false
+		close(done)
+		mcm.stateChanged()
+		mcm.mu.Unlock()
+		return
+	}
+
+	err := m.Disconnect()
 
 	mcm.mu.Lock()
 	if err == nil || errors.Is(err, ErrNoConnection) {
@@ -477,17 +485,30 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			return
 		}
 
-		// Retry entries whose cleanup errored
-		for _, e := range mcm.retiring {
-			if !e.cleanupRunning && e.cleanupDone == nil && e.cleanupErr != nil {
-				go mcm.retireEntry(e)
+		// Check for cleanup errors — fail the bulk attempt immediately,
+		// retain reconcileRequired so next request retries
+		var pendingPorts []int
+		var cleanupErrs []error
+		for port, e := range mcm.retiring {
+			if e.cleanupErr != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("port %d: %w", port, e.cleanupErr))
+			}
+			if e.cleanupRunning || e.cleanupDone == nil || e.cleanupErr != nil {
+				pendingPorts = append(pendingPorts, port)
 			}
 		}
-
-		var pendingPorts []int
-		for port := range mcm.retiring {
-			pendingPorts = append(pendingPorts, port)
+		if len(cleanupErrs) > 0 {
+			// End this bulk attempt — keep reconcileRequired, don't advance generation
+			err := fmt.Errorf("bulk cleanup failed: %w", errors.Join(cleanupErrs...))
+			mcm.activeBulk = nil
+			bulk.err = err
+			close(bulk.done)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			log.Error().Err(err).Uint64("generation", gen).Msg("Bulk disconnect failed with cleanup error")
+			return
 		}
+
 		wait := mcm.notify
 		mcm.mu.Unlock()
 
