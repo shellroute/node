@@ -830,7 +830,12 @@ func (m *connectionManager) Disconnect() error {
 		return ErrNoConnection
 	}
 	if stateWas == connectionstate.Disconnecting {
+		// Wait for existing cleanup to complete — don't return false success
 		m.statusLock.Unlock()
+		m.cleanupFinishedLock.Lock()
+		ch := m.cleanupFinished
+		m.cleanupFinishedLock.Unlock()
+		<-ch
 		return nil
 	}
 	m.status.State = connectionstate.Disconnecting
