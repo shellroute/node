@@ -72,10 +72,10 @@ type portEntry struct {
 
 	// cleanupRunning is true while a Disconnect call is in-flight on the manager.
 	cleanupRunning bool
-	// cleanupDone is closed when cleanup completes. Nil until cleanup starts.
-	cleanupDone chan struct{}
-	// cleanupErr holds the last cleanup error (nil = success or ErrNoConnection).
-	cleanupErr error
+	// cleanupResult is closed when cleanup completes. Nil until cleanup starts.
+	cleanupResult chan struct{}
+	// cleanupError holds the last cleanup error (nil = success).
+	cleanupError error
 }
 
 // bulkOp represents a shared authoritative bulk cleanup operation.
@@ -191,7 +191,10 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		mcm.stateChanged()
 		mcm.mu.Unlock()
 		go mcm.retireEntry(entry)
-		return fmt.Errorf("%w: superseded during construction", ErrLifecycleBusy)
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
+		}
+		return fmt.Errorf("%w: %w: superseded during construction", ErrConnectionCancelled, ErrLifecycleBusy)
 	}
 	mcm.mu.Unlock()
 
@@ -250,6 +253,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 			mcm.mu.Unlock()
 			return nil
 		}
+		alreadyRetiring := entry.phase == phaseRetiring
 		if mcm.current[params.ProxyPort] == entry && entry.phase == phaseConnecting {
 			delete(mcm.current, params.ProxyPort)
 			entry.phase = phaseRetiring
@@ -258,6 +262,9 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		}
 		mcm.mu.Unlock()
 		mcm.cancelManager(m)
+		if alreadyRetiring {
+			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
+		}
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 }
@@ -318,11 +325,11 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) error
 // waitRetirement waits for an entry's cleanup to complete or ctx to expire.
 func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *portEntry) error {
 	mcm.mu.Lock()
-	if entry.cleanupDone == nil {
+	if entry.cleanupResult == nil {
 		// Start cleanup
 		go mcm.retireEntry(entry)
 	}
-	done := entry.cleanupDone
+	done := entry.cleanupResult
 	mcm.mu.Unlock()
 
 	// Wait for cleanup channel to exist if it didn't yet
@@ -330,7 +337,7 @@ func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *po
 		for {
 			wait := mcm.waitNotify()
 			mcm.mu.Lock()
-			done = entry.cleanupDone
+			done = entry.cleanupResult
 			mcm.mu.Unlock()
 			if done != nil {
 				break
@@ -346,7 +353,7 @@ func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *po
 	select {
 	case <-done:
 		mcm.mu.Lock()
-		err := entry.cleanupErr
+		err := entry.cleanupError
 		mcm.mu.Unlock()
 		return err
 	case <-ctx.Done():
@@ -359,13 +366,13 @@ func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *po
 func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 	// Claim cleanup ownership under lock first — prevents double cleanup
 	mcm.mu.Lock()
-	if entry.cleanupRunning || entry.cleanupDone != nil {
+	if entry.cleanupRunning || entry.cleanupResult != nil {
 		mcm.mu.Unlock()
 		return // already started or completed
 	}
 	entry.cleanupRunning = true
 	done := make(chan struct{})
-	entry.cleanupDone = done
+	entry.cleanupResult = done
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
@@ -393,11 +400,12 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 
 	mcm.mu.Lock()
 	if err == nil || errors.Is(err, ErrNoConnection) {
-		entry.cleanupErr = nil
+		entry.cleanupError = nil
 		delete(mcm.retiring, entry.port)
 	} else {
-		entry.cleanupErr = err
-		entry.cleanupDone = nil // allow retry
+		entry.cleanupError = err
+		// Keep cleanupResult non-nil (closed) — waiters read error from cleanupError.
+		// disconnectAll clears both to allow retry.
 		log.Error().Err(err).Int("port", entry.port).Msg("Connection cleanup failed")
 	}
 	entry.cleanupRunning = false
@@ -441,9 +449,9 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 
 	// Clear prior cleanup errors/state so retireEntry can run again
 	for _, e := range mcm.retiring {
-		if e.cleanupErr != nil && !e.cleanupRunning {
-			e.cleanupErr = nil
-			e.cleanupDone = nil
+		if e.cleanupError != nil && !e.cleanupRunning {
+			e.cleanupError = nil
+			e.cleanupResult = nil
 		}
 	}
 
@@ -480,7 +488,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 	}
 	// Start missing cleanup attempts
 	for _, e := range mcm.retiring {
-		if !e.cleanupRunning && e.cleanupDone == nil {
+		if !e.cleanupRunning && e.cleanupResult == nil {
 			go mcm.retireEntry(e)
 		}
 	}
@@ -508,10 +516,10 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 		var pendingPorts []int
 		var cleanupErrs []error
 		for port, e := range mcm.retiring {
-			if e.cleanupErr != nil {
-				cleanupErrs = append(cleanupErrs, fmt.Errorf("port %d: %w", port, e.cleanupErr))
+			if e.cleanupError != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("port %d: %w", port, e.cleanupError))
 			}
-			if e.cleanupRunning || e.cleanupDone == nil || e.cleanupErr != nil {
+			if e.cleanupRunning || e.cleanupResult == nil || e.cleanupError != nil {
 				pendingPorts = append(pendingPorts, port)
 			}
 		}
