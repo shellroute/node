@@ -139,6 +139,8 @@ func (mcm *multiConnectionManager) waitNotify() <-chan struct{} {
 
 // Connect creates a new connection on the given port.
 // Returns ErrLifecycleBusy if reconciliation is active or the port is retiring.
+// The manager worker owns its own lifecycle — on caller cancellation, the caller
+// returns immediately while the worker finalizes (retire/cleanup) asynchronously.
 func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -177,6 +179,8 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		return ErrAlreadyExists
 	}
 
+	// operationDone is closed by the worker when Connect completes
+	operationDone := make(chan struct{})
 	entry := &portEntry{
 		port:       params.ProxyPort,
 		generation: mcm.generation,
@@ -188,62 +192,57 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	// Run connect outside lock — cancellable via context
-	type connectResult struct{ err error }
-	resultCh := make(chan connectResult, 1)
+	// Worker owns finalization — caller never blocks on worker completion.
+	var workerErr error
 	go func() {
-		resultCh <- connectResult{m.Connect(consumerID, hermesID, proposalLookup, params)}
-	}()
+		defer close(operationDone)
+		workerErr = m.Connect(consumerID, hermesID, proposalLookup, params)
 
-	var err error
-	select {
-	case r := <-resultCh:
-		err = r.err
-	case <-ctx.Done():
-		// Caller cancelled — request cancellation and wait for worker to finish
-		mcm.cancelManager(m)
-		// Must consume the worker result to prevent orphan tunnel
-		r := <-resultCh
-		// Move to retiring regardless of worker outcome
 		mcm.mu.Lock()
-		if e, ok := mcm.current[params.ProxyPort]; ok && e == entry {
+		e, stillCurrent := mcm.current[params.ProxyPort]
+
+		if entry.phase == phaseRetiring {
+			// Caller cancelled — we're already retired. Start cleanup.
+			mcm.mu.Unlock()
+			mcm.retireEntry(entry)
+			return
+		}
+
+		if workerErr == nil && stillCurrent && e == entry && mcm.generation == gen && !mcm.reconcileRequired {
+			entry.phase = phaseActive
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			return
+		}
+
+		// Stale, superseded, or failed — retire
+		if stillCurrent && e == entry {
 			delete(mcm.current, params.ProxyPort)
 		}
 		entry.phase = phaseRetiring
 		mcm.retiring[params.ProxyPort] = entry
 		mcm.stateChanged()
 		mcm.mu.Unlock()
-		// If connect succeeded, we still need to disconnect
-		if r.err == nil {
-			go mcm.retireEntry(entry)
-		} else {
-			go mcm.retireEntry(entry)
+		mcm.retireEntry(entry)
+	}()
+
+	// Caller waits for worker completion or ctx cancellation
+	select {
+	case <-operationDone:
+		return workerErr
+	case <-ctx.Done():
+		// Mark entry as retiring — worker will see this and handle cleanup
+		mcm.mu.Lock()
+		if e, ok := mcm.current[params.ProxyPort]; ok && e == entry {
+			delete(mcm.current, params.ProxyPort)
+			entry.phase = phaseRetiring
+			mcm.retiring[params.ProxyPort] = entry
+			mcm.stateChanged()
 		}
+		mcm.mu.Unlock()
+		mcm.cancelManager(m)
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
-
-	mcm.mu.Lock()
-	e, stillCurrent := mcm.current[params.ProxyPort]
-	if err == nil && stillCurrent && e == entry && mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
-		entry.phase = phaseActive
-		mcm.stateChanged()
-		mcm.mu.Unlock()
-		return nil
-	}
-	// Stale, superseded, or failed — retire
-	if stillCurrent && e == entry {
-		delete(mcm.current, params.ProxyPort)
-	}
-	entry.phase = phaseRetiring
-	mcm.retiring[params.ProxyPort] = entry
-	mcm.stateChanged()
-	mcm.mu.Unlock()
-	go mcm.retireEntry(entry)
-
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: connect superseded by bulk cleanup", ErrLifecycleBusy)
 }
 
 // Status queries current status of connection.
@@ -369,8 +368,8 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 }
 
 // disconnectAll performs authoritative bulk cleanup. Concurrent callers
-// share the same operation. Returns nil only when all covered entries
-// retired successfully.
+// share the same operation. The bulk worker runs in its own server-owned
+// goroutine — HTTP callers only wait on the result channel.
 func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	mcm.mu.Lock()
 
@@ -386,12 +385,11 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 		}
 	}
 
-	// Start new bulk operation
+	// Start new bulk operation — server-owned goroutine
 	mcm.reconcileRequired = true
 	mcm.generation++
 	gen := mcm.generation
 
-	// Move all current entries to retiring
 	for port, e := range mcm.current {
 		e.phase = phaseRetiring
 		mcm.retiring[port] = e
@@ -403,21 +401,30 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
+	// Launch server-owned bulk worker
+	go mcm.bulkWorker(bulk, gen)
+
+	// Caller waits for result or ctx cancellation
+	select {
+	case <-bulk.done:
+		return bulk.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// bulkWorker is the server-owned goroutine that drives bulk cleanup to
+// completion. It cancels in-flight ops, starts missing cleanups, and waits
+// for all retiring entries to resolve. Never exits until done or timed out.
+func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
 
 	// Cancel in-flight operations
 	mcm.mu.Lock()
-	var managers []Manager
 	for _, e := range mcm.retiring {
-		managers = append(managers, e.manager)
+		mcm.cancelManager(e.manager)
 	}
-	mcm.mu.Unlock()
-	for _, m := range managers {
-		mcm.cancelManager(m)
-	}
-
 	// Start missing cleanup attempts
-	mcm.mu.Lock()
 	for _, e := range mcm.retiring {
 		if !e.cleanupRunning && e.cleanupDone == nil {
 			go mcm.retireEntry(e)
@@ -425,36 +432,10 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	}
 	mcm.mu.Unlock()
 
-	// Wait for all retiring entries to complete
 	deadline := time.After(mcm.BulkTimeout)
 	for {
 		mcm.mu.Lock()
-		allDone := true
-		var pendingPorts []int
-		for port, e := range mcm.retiring {
-			if e.cleanupErr != nil || e.cleanupRunning || e.cleanupDone == nil {
-				allDone = false
-				pendingPorts = append(pendingPorts, port)
-			} else {
-				// Check if done channel is closed
-				select {
-				case <-e.cleanupDone:
-					if e.cleanupErr != nil {
-						allDone = false
-						pendingPorts = append(pendingPorts, port)
-					}
-				default:
-					allDone = false
-					pendingPorts = append(pendingPorts, port)
-				}
-			}
-		}
-
 		if len(mcm.retiring) == 0 {
-			allDone = true
-		}
-
-		if allDone {
 			mcm.reconcileRequired = false
 			mcm.activeBulk = nil
 			bulk.err = nil
@@ -462,9 +443,20 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			log.Info().Uint64("generation", gen).Msg("Bulk disconnect completed successfully")
-			return nil
+			return
 		}
 
+		// Retry entries whose cleanup errored
+		for _, e := range mcm.retiring {
+			if !e.cleanupRunning && e.cleanupDone == nil && e.cleanupErr != nil {
+				go mcm.retireEntry(e)
+			}
+		}
+
+		var pendingPorts []int
+		for port := range mcm.retiring {
+			pendingPorts = append(pendingPorts, port)
+		}
 		wait := mcm.notify
 		mcm.mu.Unlock()
 
@@ -472,11 +464,11 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 		case <-wait:
 			continue
 		case <-deadline:
-			// Timeout — dump goroutines once per generation
 			mcm.mu.Lock()
 			if mcm.dumpedGen != gen {
 				mcm.dumpedGen = gen
 				mcm.mu.Unlock()
+				sort.Ints(pendingPorts)
 				log.Warn().Uint64("generation", gen).Ints("pending_ports", pendingPorts).
 					Msg("Bulk disconnect timeout — dumping goroutines")
 				pprof.Lookup("goroutine").WriteTo(log.Logger, 2)
@@ -493,44 +485,6 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			log.Error().Err(err).Uint64("generation", gen).Msg("Bulk disconnect failed")
-			return err
-		case <-ctx.Done():
-			// Caller gave up — spawn background waiter to complete the bulk op
-			go mcm.finishBulk(bulk, gen)
-			return ctx.Err()
-		}
-	}
-}
-
-// finishBulk continues bulk cleanup in the background after the HTTP caller gave up.
-func (mcm *multiConnectionManager) finishBulk(bulk *bulkOp, gen uint64) {
-	deadline := time.After(mcm.BulkTimeout)
-	for {
-		mcm.mu.Lock()
-		allDone := len(mcm.retiring) == 0
-		if allDone {
-			mcm.reconcileRequired = false
-			mcm.activeBulk = nil
-			bulk.err = nil
-			close(bulk.done)
-			mcm.stateChanged()
-			mcm.mu.Unlock()
-			return
-		}
-		wait := mcm.notify
-		mcm.mu.Unlock()
-
-		select {
-		case <-wait:
-			continue
-		case <-deadline:
-			err := fmt.Errorf("background bulk cleanup timeout")
-			mcm.mu.Lock()
-			mcm.activeBulk = nil
-			bulk.err = err
-			close(bulk.done)
-			mcm.stateChanged()
-			mcm.mu.Unlock()
 			return
 		}
 	}
