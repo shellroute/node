@@ -404,7 +404,13 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 		return
 	}
 
-	err := m.Disconnect()
+	// Use DisconnectContext if available for truthful completion
+	var err error
+	if lm, ok := m.(lifecycleManager); ok {
+		err = lm.DisconnectContext(context.Background())
+	} else {
+		err = m.Disconnect()
+	}
 
 	mcm.mu.Lock()
 	if err == nil || errors.Is(err, ErrNoConnection) {

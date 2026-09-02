@@ -228,12 +228,28 @@ func (m *connectionManager) chainID() int64 {
 	return config.GetInt64(config.FlagChainID)
 }
 
-func (m *connectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) (err error) {
+// Connect is the legacy compatibility wrapper. Calls ConnectContext with Background.
+func (m *connectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
+	return m.ConnectContext(context.Background(), consumerID, hermesID, proposalLookup, params)
+}
+
+// ConnectContext establishes a connection with context-aware cancellation.
+// The caller's ctx can cancel establishment (proposal lookup through
+// waitForConnectedState). After success, the connection's lifetime is
+// independent of the caller's context.
+func (m *connectionManager) ConnectContext(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) (err error) {
 	var sessionID session.ID
+
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
 
 	proposal, err := proposalLookup()
 	if err != nil {
 		return fmt.Errorf("failed to lookup proposal: %w", err)
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
 	tracer := trace.NewTracer("Consumer whole Connect")
@@ -242,8 +258,6 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 		log.Debug().Msgf("Consumer connection trace: %s", traceResult)
 	}()
 
-	// make sure cache is cleared when connect terminates at any stage as part of disconnect
-	// we assume that IPResolver might be used / cache IP before connect
 	m.addCleanup(func() error {
 		m.clearIPCache()
 		return nil
@@ -259,14 +273,26 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
 
+	// Create lifetime context — separate from caller's ctx.
+	// Caller ctx cancels only during establishment; after success,
+	// the connection lives independently.
 	m.ctxLock.Lock()
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.ctxLock.Unlock()
 
+	// Cancel lifetime ctx if caller ctx expires during establishment
+	stopAfterFunc := context.AfterFunc(ctx, func() {
+		m.CancelCurrentOperation()
+	})
+
 	m.statusConnecting(consumerID, hermesID, *proposal)
 	defer func() {
 		if err != nil {
+			stopAfterFunc() // stop the afterfunc if still pending
 			log.Err(err).Msg("Connect failed, disconnecting")
 			m.disconnect()
 		}
@@ -302,6 +328,12 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 		return m.handleStartError(sessionID, err)
 	}
 
+	// Success — stop the afterfunc and check for late cancellation
+	if !stopAfterFunc() {
+		// AfterFunc already fired — cancellation won during establishment
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
 	m.statsTracker = newStatsTracker(m.eventBus, m.statsReportInterval)
 	go m.statsTracker.start(m, m.activeConnection)
 	m.addCleanup(func() error {
@@ -318,26 +350,33 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 	return nil
 }
 
-// ConnectContext is the context-aware connect. The coordinator calls this
-// via lifecycleManager type assertion. It delegates to Connect which owns
-// the lifetime context internally. Cancellation is handled via CancelCurrentOperation.
-func (m *connectionManager) ConnectContext(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
-	// The coordinator owns the ctx select; this runs synchronously in the worker.
-	// CancelCurrentOperation is called by the coordinator on ctx cancel.
-	return m.Connect(consumerID, hermesID, proposalLookup, params)
-}
-
-// DisconnectContext is the context-aware disconnect. Waits for real completion.
-// The coordinator owns the ctx select; this runs synchronously.
+// DisconnectContext waits for real disconnect completion. The coordinator
+// calls this via lifecycleManager type assertion.
 func (m *connectionManager) DisconnectContext(ctx context.Context) error {
 	return m.Disconnect()
 }
 
-// ReconnectContext is the context-aware reconnect with error return.
-// The coordinator owns the ctx select; this runs synchronously.
+// ReconnectContext disconnects then reconnects with error reporting.
 func (m *connectionManager) ReconnectContext(ctx context.Context) error {
-	m.Reconnect()
-	return nil
+	err := m.Disconnect()
+	if err != nil && !errors.Is(err, ErrNoConnection) {
+		return err
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
+	// Wait for cleanup to complete
+	m.cleanupFinishedLock.Lock()
+	ch := m.cleanupFinished
+	m.cleanupFinishedLock.Unlock()
+	<-ch
+
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
+	return m.ConnectContext(ctx, m.connectOptions.ConsumerID, m.connectOptions.HermesID, m.connectOptions.ProposalLookup, m.connectOptions.Params)
 }
 
 func (m *connectionManager) autoReconnect() (err error) {
@@ -1090,20 +1129,7 @@ func (m *connectionManager) currentCtx() context.Context {
 }
 
 func (m *connectionManager) Reconnect() {
-	err := m.Disconnect()
-	if err != nil {
-		log.Error().Err(err).Msgf("Failed to disconnect stale session")
-	}
-	log.Info().Msg("Waiting for previous session to cleanup")
-
-	// Capture the channel reference while holding the lock, then release the lock
-	// before waiting. This prevents a deadlock where Connect() fails and its deferred
-	// disconnect() tries to re-acquire cleanupFinishedLock.
-	m.cleanupFinishedLock.Lock()
-	ch := m.cleanupFinished
-	m.cleanupFinishedLock.Unlock()
-	<-ch
-	err = m.Connect(m.connectOptions.ConsumerID, m.connectOptions.HermesID, m.connectOptions.ProposalLookup, m.connectOptions.Params)
+	err := m.ReconnectContext(context.Background())
 	if err != nil {
 		log.Error().Err(err).Msgf("Failed to reconnect")
 	}
