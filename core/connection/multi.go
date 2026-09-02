@@ -569,17 +569,51 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 }
 
 // Reconnect disconnects and reconnects on the given port.
+// Rejects if reconciliation is active (prevents restoring a superseded connection).
 func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	mcm.mu.Lock()
+	if mcm.reconcileRequired {
+		mcm.mu.Unlock()
+		return ErrLifecycleBusy
+	}
 	e, ok := mcm.current[id]
 	if !ok {
 		mcm.mu.Unlock()
 		return ErrNoConnection
 	}
+	if e.manager == nil {
+		mcm.mu.Unlock()
+		return ErrNoConnection
+	}
+	gen := mcm.generation
 	m := e.manager
+	e.phase = phaseReconnecting
+	mcm.stateChanged()
 	mcm.mu.Unlock()
 
 	m.Reconnect()
+
+	// After reconnect, verify generation hasn't advanced (bulk may have run)
+	mcm.mu.Lock()
+	if mcm.generation != gen || mcm.reconcileRequired {
+		// Superseded — retire this entry
+		if mcm.current[id] == e {
+			delete(mcm.current, id)
+			e.phase = phaseRetiring
+			mcm.retiring[id] = e
+			mcm.stateChanged()
+		}
+		mcm.mu.Unlock()
+		go mcm.retireEntry(e)
+		return ErrLifecycleBusy
+	}
+	e.phase = phaseActive
+	mcm.stateChanged()
+	mcm.mu.Unlock()
 	return nil
 }
 
