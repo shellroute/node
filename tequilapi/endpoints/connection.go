@@ -144,6 +144,10 @@ func (ce *ConnectionEndpoint) Status(c *gin.Context) {
 //	    description: Internal server error
 //	    schema:
 //	      "$ref": "#/definitions/APIError"
+//	  503:
+//	    description: Lifecycle busy or request cancelled
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 	hermes, err := ce.addressProvider.GetActiveHermes(config.GetInt64(config.FlagChainID))
 	if err != nil {
@@ -254,6 +258,10 @@ func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 //	      "$ref": "#/definitions/APIError"
 //	  500:
 //	    description: Internal server error
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
+//	  503:
+//	    description: Lifecycle busy or request cancelled
 //	    schema:
 //	      "$ref": "#/definitions/APIError"
 func (ce *ConnectionEndpoint) Kill(c *gin.Context) {

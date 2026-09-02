@@ -528,3 +528,103 @@ func TestReconnectSucceeds(t *testing.T) {
 		t.Errorf("expected 1 current entry, got %d", n)
 	}
 }
+
+// --- Gateway-style retry test ---
+
+func TestGatewayRetryAfterTimeout(t *testing.T) {
+	// Simulate: first bulk request times out, cleanup completes later, second bulk succeeds
+	gate := make(chan struct{})
+	mcm := NewMultiConnectionManager(func() Manager {
+		return &blockingDisconnectManager{gate: gate}
+	})
+	mcm.BulkTimeout = 100 * time.Millisecond
+
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	// First bulk — will timeout because disconnect blocks
+	err1 := mcm.Disconnect(bg(), -1)
+	if err1 == nil {
+		t.Fatal("first bulk should timeout")
+	}
+	if !errors.Is(err1, ErrLifecycleBusy) {
+		t.Errorf("expected ErrLifecycleBusy, got %v", err1)
+	}
+
+	// New connects should fail while reconciling
+	err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
+	if !errors.Is(err, ErrLifecycleBusy) {
+		t.Errorf("connect during unresolved reconciliation should return ErrLifecycleBusy, got %v", err)
+	}
+
+	// Unblock the stuck disconnect
+	close(gate)
+
+	// Second bulk — should succeed now that disconnect completed
+	err2 := mcm.Disconnect(bg(), -1)
+	if err2 != nil {
+		t.Errorf("second bulk should succeed, got %v", err2)
+	}
+
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty, got %d", n)
+	}
+	if n := retiringLen(mcm); n != 0 {
+		t.Errorf("retiring should be empty, got %d", n)
+	}
+
+	// Connect after successful reconciliation should work
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
+		t.Errorf("connect after resolved reconciliation should work, got %v", err)
+	}
+}
+
+// --- Stress test ---
+
+func TestRaceStressConnectDisconnect(t *testing.T) {
+	mcm, _ := newTestMulti()
+
+	var wg sync.WaitGroup
+	// 10 goroutines each doing 20 connect/disconnect cycles
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(port))
+				mcm.Disconnect(bg(), port)
+			}
+		}(g * 100)
+	}
+
+	// Concurrent bulk disconnects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			mcm.Disconnect(bg(), -1)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stress test did not complete within 10s")
+	}
+
+	// Final cleanup
+	mcm.Disconnect(bg(), -1)
+
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty after stress, got %d", n)
+	}
+	if n := retiringLen(mcm); n != 0 {
+		t.Errorf("retiring should be empty after stress, got %d", n)
+	}
+}
