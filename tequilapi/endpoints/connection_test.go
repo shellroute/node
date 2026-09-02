@@ -56,7 +56,7 @@ type mockConnectionManager struct {
 	requestedServiceType string
 }
 
-func (cm *mockConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup connection.ProposalLookup, options connection.ConnectParams) error {
+func (cm *mockConnectionManager) Connect(_ context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup connection.ProposalLookup, options connection.ConnectParams) error {
 	proposal, _ := proposalLookup()
 	if proposal == nil {
 		return errors.New("no proposal")
@@ -77,7 +77,7 @@ func (cm *mockConnectionManager) Stats(int) connectionstate.Statistics {
 	return connectionstate.Statistics{}
 }
 
-func (cm *mockConnectionManager) Disconnect(int) error {
+func (cm *mockConnectionManager) Disconnect(_ context.Context, _ int) error {
 	cm.disconnectCount++
 	return cm.onDisconnectReturn
 }
@@ -86,8 +86,8 @@ func (cm *mockConnectionManager) CheckChannel(context.Context) error {
 	return cm.onCheckChannelReturn
 }
 
-func (cm *mockConnectionManager) Reconnect(int) {
-	return
+func (cm *mockConnectionManager) Reconnect(_ context.Context, _ int) error {
+	return nil
 }
 
 func mockRepositoryWithProposal(providerID, serviceType string) *mockProposalRepository {

@@ -18,6 +18,10 @@
 package cmd
 
 import (
+	"context"
+	"errors"
+	"time"
+
 	"github.com/rs/zerolog/log"
 
 	"github.com/mysteriumnetwork/node/core/connection"
@@ -44,21 +48,23 @@ type SleepNotifier interface {
 // NewNode function creates new Mysterium node by given options
 func NewNode(connectionManager connection.MultiManager, tequilapiServer tequilapi.APIServer, publisher Publisher, uiServer UIServer, notifier SleepNotifier) *Node {
 	return &Node{
-		connectionManager: connectionManager,
-		httpAPIServer:     tequilapiServer,
-		publisher:         publisher,
-		uiServer:          uiServer,
-		sleepNotifier:     notifier,
+		connectionManager:  connectionManager,
+		httpAPIServer:      tequilapiServer,
+		publisher:          publisher,
+		uiServer:           uiServer,
+		sleepNotifier:      notifier,
+		ShutdownTimeout:    5 * time.Second,
 	}
 }
 
 // Node represent entrypoint for Mysterium node with top level components
 type Node struct {
-	connectionManager connection.MultiManager
-	httpAPIServer     tequilapi.APIServer
-	publisher         Publisher
-	uiServer          UIServer
-	sleepNotifier     SleepNotifier
+	connectionManager  connection.MultiManager
+	httpAPIServer      tequilapi.APIServer
+	publisher          Publisher
+	uiServer           UIServer
+	sleepNotifier      SleepNotifier
+	ShutdownTimeout    time.Duration // injectable for tests; default 5s
 }
 
 // Start starts Mysterium node (Tequilapi service, fetches location)
@@ -78,15 +84,19 @@ func (node *Node) Wait() error {
 	return node.httpAPIServer.Wait()
 }
 
-// Kill stops Mysterium node
+// Kill stops Mysterium node. Connection cleanup is bounded by ShutdownTimeout.
+// All stop methods are called regardless of cleanup outcome.
 func (node *Node) Kill() error {
-	err := node.connectionManager.Disconnect(-1)
-	if err != nil {
-		switch err {
-		case connection.ErrNoConnection:
+	ctx, cancel := context.WithTimeout(context.Background(), node.ShutdownTimeout)
+	defer cancel()
+
+	disconnectErr := node.connectionManager.Disconnect(ctx, -1)
+	if disconnectErr != nil {
+		if errors.Is(disconnectErr, connection.ErrNoConnection) {
 			log.Info().Msg("No active connection - proceeding")
-		default:
-			return err
+			disconnectErr = nil
+		} else {
+			log.Error().Err(disconnectErr).Msg("Connection cleanup error (proceeding with shutdown)")
 		}
 	} else {
 		log.Info().Msg("Connection closed")
@@ -101,5 +111,5 @@ func (node *Node) Kill() error {
 	node.sleepNotifier.Stop()
 	log.Info().Msg("Sleep notifier stopped")
 
-	return nil
+	return disconnectErr
 }

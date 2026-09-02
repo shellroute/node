@@ -667,7 +667,7 @@ func (mb *MobileNode) Connect(req *ConnectRequest) *ConnectResponse {
 		}
 	}
 
-	if err := mb.connectionManager.Connect(identity.FromAddress(req.IdentityAddress), hermes, proposalLookup, connectOptions); err != nil {
+	if err := mb.connectionManager.Connect(context.Background(), identity.FromAddress(req.IdentityAddress), hermes, proposalLookup, connectOptions); err != nil {
 		qualityEvent.Stage = quality.StageConnectionUnknownError
 		qualityEvent.Error = err.Error()
 		mb.eventBus.Publish(quality.AppTopicConnectionEvents, qualityEvent)
@@ -698,7 +698,7 @@ func (mb *MobileNode) Reconnect(req *ConnectRequest) *ConnectResponse {
 
 // Disconnect disconnects or cancels current connection.
 func (mb *MobileNode) Disconnect() error {
-	if err := mb.connectionManager.Disconnect(0); err != nil {
+	if err := mb.connectionManager.Disconnect(context.Background(), 0); err != nil {
 		return fmt.Errorf("could not disconnect: %w", err)
 	}
 

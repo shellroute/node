@@ -60,6 +60,9 @@ var (
 	ErrConnectionCancelled = errors.New("connection was cancelled")
 	// ErrConnectionFailed indicates that Connect method didn't reach "Connected" phase due to connection error
 	ErrConnectionFailed = errors.New("connection has failed")
+	// ErrLifecycleBusy indicates an authoritative bulk cleanup is active/unresolved,
+	// the requested port is still retiring, or an in-flight operation was superseded.
+	ErrLifecycleBusy = errors.New("lifecycle busy")
 	// ErrUnsupportedServiceType indicates that target proposal contains unsupported service type
 	ErrUnsupportedServiceType = errors.New("unsupported service type in proposal")
 	// ErrInsufficientBalance indicates consumer has insufficient balance to connect to selected proposal

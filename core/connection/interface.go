@@ -61,15 +61,16 @@ type Manager interface {
 // MultiManager interface provides methods to manage connection
 type MultiManager interface {
 	// Connect creates new connection from given consumer to provider, reports error if connection already exists
-	Connect(consumerID identity.Identity, hermesID common.Address, proposal ProposalLookup, params ConnectParams) error
+	Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposal ProposalLookup, params ConnectParams) error
 	// Status queries current status of connection
 	Status(n int) connectionstate.Status
 	// Stats provides connection statistics information.
 	Stats(n int) connectionstate.Statistics
-	// Disconnect closes established connection, reports error if no connection
-	Disconnect(n int) error
+	// Disconnect closes established connection, reports error if no connection.
+	// id < 0 disconnects all connections (authoritative bulk cleanup).
+	Disconnect(ctx context.Context, id int) error
 	// CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping
 	CheckChannel(context.Context) error
 	// Reconnect reconnects current session
-	Reconnect(n int)
+	Reconnect(ctx context.Context, id int) error
 }
