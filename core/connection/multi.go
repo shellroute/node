@@ -180,6 +180,19 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	m := mcm.newConnectionManager()
 	mcm.mu.Lock()
 	entry.manager = m
+	// Check if superseded during factory construction (bulk may have advanced)
+	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired {
+		entry.phase = phaseRetiring
+		if mcm.current[params.ProxyPort] == entry {
+			delete(mcm.current, params.ProxyPort)
+		}
+		mcm.retiring[params.ProxyPort] = entry
+		close(opDone)
+		mcm.stateChanged()
+		mcm.mu.Unlock()
+		go mcm.retireEntry(entry)
+		return fmt.Errorf("%w: superseded during construction", ErrLifecycleBusy)
+	}
 	mcm.mu.Unlock()
 
 	// resultErr is the error returned to the caller. Set by worker before
