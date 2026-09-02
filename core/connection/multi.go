@@ -182,24 +182,28 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	entry.manager = m
 	mcm.mu.Unlock()
 
-	// Worker: runs Connect, then finalizes under lock
-	var workerErr error
+	// resultErr is the error returned to the caller. Set by worker before
+	// closing opDone. Distinct from the raw connect error when superseded.
+	var resultErr error
 	go func() {
-		workerErr = m.Connect(consumerID, hermesID, proposalLookup, params)
+		connectErr := m.Connect(consumerID, hermesID, proposalLookup, params)
 
 		mcm.mu.Lock()
-		// Signal operation finished — cleanup can now proceed
-		close(opDone)
 
 		if entry.phase == phaseRetiring {
-			// Caller or bulk cancelled — cleanup will be started by retireEntry
+			// Caller or bulk cancelled — we own cleanup
+			resultErr = fmt.Errorf("%w: %w", ErrConnectionCancelled, ErrLifecycleBusy)
+			close(opDone)
 			mcm.mu.Unlock()
+			mcm.retireEntry(entry)
 			return
 		}
 
-		if workerErr == nil && mcm.current[params.ProxyPort] == entry &&
+		if connectErr == nil && mcm.current[params.ProxyPort] == entry &&
 			mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
 			entry.phase = phaseActive
+			resultErr = nil
+			close(opDone)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			return
@@ -211,15 +215,20 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		}
 		entry.phase = phaseRetiring
 		mcm.retiring[params.ProxyPort] = entry
+		if connectErr != nil {
+			resultErr = connectErr
+		} else {
+			resultErr = fmt.Errorf("%w: connect superseded", ErrLifecycleBusy)
+		}
+		close(opDone)
 		mcm.stateChanged()
 		mcm.mu.Unlock()
 		mcm.retireEntry(entry)
 	}()
 
-	// Caller: wait for worker or ctx cancellation
 	select {
 	case <-opDone:
-		return workerErr
+		return resultErr
 	case <-ctx.Done():
 		mcm.mu.Lock()
 		if mcm.current[params.ProxyPort] == entry {
