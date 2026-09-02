@@ -266,20 +266,18 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	// Cancel lifetime ctx if caller ctx expires during establishment
 	stopAfterFunc := context.AfterFunc(ctx, lifetimeCancel)
 
-	// Error cleanup — installed immediately after lifetime ctx creation.
-	// Catches failures at ANY stage (proposal, validation, connection, etc.)
+	// Error cleanup — always cancel lifetime ctx on error.
+	// DisconnectContext only if state moved past NotConnected.
 	defer func() {
 		if err != nil {
 			stopAfterFunc()
+			lifetimeCancel()
 			log.Err(err).Msg("Connect failed, disconnecting")
-			m.DisconnectContext(context.Background())
+			if m.Status().State != connectionstate.NotConnected {
+				m.DisconnectContext(context.Background())
+			}
 		}
 	}()
-
-	m.addCleanup(func() error {
-		m.clearIPCache()
-		return nil
-	})
 
 	// Check ctx before each external stage
 	proposal, err := proposalLookup()
@@ -326,13 +324,22 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
 
 	sessionID, err = m.initSession(tracer, prc)
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
 
 	originalPublicIP := m.getPublicIP()
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
 
 	err = m.startConnection(m.currentCtx(), m.activeConnection, m.activeConnection.Start, m.connectOptions, tracer)
 	if err != nil {
@@ -961,13 +968,8 @@ func (m *connectionManager) disconnect() {
 
 // runDisconnectCleanup does the actual cleanup work. Called exactly once per attempt.
 func (m *connectionManager) runDisconnectCleanup() {
-	// Copy cancel under lock, invoke outside — plan invariant 1
-	m.ctxLock.RLock()
-	cancelFn := m.cancel
-	m.ctxLock.RUnlock()
-	if cancelFn != nil {
-		cancelFn()
-	}
+	// Cancel in-flight operation via public API — safe for concurrent use
+	m.CancelCurrentOperation()
 
 	m.cleanConnection()
 	m.statusNotConnected()

@@ -404,10 +404,12 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 		return
 	}
 
-	// Use DisconnectContext if available for truthful completion
+	// Use DisconnectContext with hard deadline to prevent unbounded hangs
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cleanupCancel()
 	var err error
 	if lm, ok := m.(lifecycleManager); ok {
-		err = lm.DisconnectContext(context.Background())
+		err = lm.DisconnectContext(cleanupCtx)
 	} else {
 		err = m.Disconnect()
 	}
@@ -613,8 +615,9 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 
 	var resultErr error
 	go func() {
+		var reconErr error
 		if lm, ok := m.(lifecycleManager); ok {
-			lm.ReconnectContext(ctx)
+			reconErr = lm.ReconnectContext(ctx)
 		} else {
 			m.Reconnect()
 		}
@@ -629,7 +632,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 			return
 		}
 
-		if mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
+		if reconErr == nil && mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
 			e.phase = phaseActive
 			resultErr = nil
 			close(opDone)
@@ -638,13 +641,17 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 			return
 		}
 
-		// Superseded
+		// Failed, superseded, or stale — retire
 		if mcm.current[id] == e {
 			delete(mcm.current, id)
 		}
 		e.phase = phaseRetiring
 		mcm.retiring[id] = e
-		resultErr = ErrLifecycleBusy
+		if reconErr != nil {
+			resultErr = reconErr
+		} else {
+			resultErr = ErrLifecycleBusy
+		}
 		close(opDone)
 		mcm.stateChanged()
 		mcm.mu.Unlock()
