@@ -569,7 +569,8 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 }
 
 // Reconnect disconnects and reconnects on the given port.
-// Rejects if reconciliation is active (prevents restoring a superseded connection).
+// Uses the same worker-owned pattern as Connect: new operationDone,
+// ctx select, cleanup waits for operation completion.
 func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -585,36 +586,72 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 		mcm.mu.Unlock()
 		return ErrNoConnection
 	}
-	if e.manager == nil {
+	if e.manager == nil || e.phase == phaseReconnecting || e.phase == phaseConnecting {
 		mcm.mu.Unlock()
-		return ErrNoConnection
+		return ErrLifecycleBusy
 	}
 	gen := mcm.generation
 	m := e.manager
 	e.phase = phaseReconnecting
+	// New operationDone for this reconnect — cleanup must wait for it
+	opDone := make(chan struct{})
+	e.operationDone = opDone
+	e.cleanupAttempt = nil // reset any prior attempt
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	m.Reconnect()
+	var resultErr error
+	go func() {
+		m.Reconnect()
 
-	// After reconnect, verify generation hasn't advanced (bulk may have run)
-	mcm.mu.Lock()
-	if mcm.generation != gen || mcm.reconcileRequired {
-		// Superseded — retire this entry
+		mcm.mu.Lock()
+		close(opDone)
+
+		if e.phase == phaseRetiring {
+			mcm.mu.Unlock()
+			mcm.retireEntry(e)
+			return
+		}
+
+		if mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
+			e.phase = phaseActive
+			resultErr = nil
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			return
+		}
+
+		// Superseded
 		if mcm.current[id] == e {
+			delete(mcm.current, id)
+		}
+		e.phase = phaseRetiring
+		mcm.retiring[id] = e
+		resultErr = ErrLifecycleBusy
+		mcm.stateChanged()
+		mcm.mu.Unlock()
+		mcm.retireEntry(e)
+	}()
+
+	select {
+	case <-opDone:
+		return resultErr
+	case <-ctx.Done():
+		mcm.mu.Lock()
+		if e.phase == phaseActive {
+			mcm.mu.Unlock()
+			return nil
+		}
+		if mcm.current[id] == e && e.phase == phaseReconnecting {
 			delete(mcm.current, id)
 			e.phase = phaseRetiring
 			mcm.retiring[id] = e
 			mcm.stateChanged()
 		}
 		mcm.mu.Unlock()
-		go mcm.retireEntry(e)
-		return ErrLifecycleBusy
+		mcm.cancelManager(m)
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
-	e.phase = phaseActive
-	mcm.stateChanged()
-	mcm.mu.Unlock()
-	return nil
 }
 
 // CheckChannel checks if current session channel is alive.
