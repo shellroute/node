@@ -830,21 +830,26 @@ func (m *connectionManager) Disconnect() error {
 		return ErrNoConnection
 	}
 	if stateWas == connectionstate.Disconnecting {
-		// Wait for existing cleanup to complete — don't return false success
-		m.statusLock.Unlock()
+		// Attach to existing cleanup — read channel under same lock
 		m.cleanupFinishedLock.Lock()
 		ch := m.cleanupFinished
 		m.cleanupFinishedLock.Unlock()
+		m.statusLock.Unlock()
 		<-ch
 		return nil
 	}
+	// Publish completion channel atomically with state transition
+	m.cleanupFinishedLock.Lock()
+	m.cleanupFinished = make(chan struct{})
+	ch := m.cleanupFinished
+	m.cleanupFinishedLock.Unlock()
 	m.status.State = connectionstate.Disconnecting
 	m.statusLock.Unlock()
 
 	log.Info().Msgf("Connection state: %v -> %v", stateWas, connectionstate.Disconnecting)
 	m.publishStateEvent(connectionstate.Disconnecting)
 
-	m.disconnect()
+	m.disconnectCleanup(ch)
 
 	return nil
 }
@@ -857,13 +862,18 @@ func (m *connectionManager) CheckChannel(ctx context.Context) error {
 }
 
 func (m *connectionManager) disconnect() {
+	// Legacy path for internal callers (Connect failure defer, Cancel, etc.)
+	m.cleanupFinishedLock.Lock()
+	m.cleanupFinished = make(chan struct{})
+	ch := m.cleanupFinished
+	m.cleanupFinishedLock.Unlock()
+	m.disconnectCleanup(ch)
+}
+
+func (m *connectionManager) disconnectCleanup(done chan struct{}) {
 	m.discoLock.Lock()
 	defer m.discoLock.Unlock()
-
-	m.cleanupFinishedLock.Lock()
-	defer m.cleanupFinishedLock.Unlock()
-	m.cleanupFinished = make(chan struct{})
-	defer close(m.cleanupFinished)
+	defer close(done)
 
 	m.ctxLock.Lock()
 	m.cancel()
