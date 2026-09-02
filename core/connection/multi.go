@@ -208,7 +208,12 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	// closing opDone. Distinct from the raw connect error when superseded.
 	var resultErr error
 	go func() {
-		connectErr := m.Connect(consumerID, hermesID, proposalLookup, params)
+		var connectErr error
+		if lm, ok := m.(lifecycleManager); ok {
+			connectErr = lm.ConnectContext(ctx, consumerID, hermesID, proposalLookup, params)
+		} else {
+			connectErr = m.Connect(consumerID, hermesID, proposalLookup, params)
+		}
 
 		mcm.mu.Lock()
 
@@ -602,7 +607,11 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 
 	var resultErr error
 	go func() {
-		m.Reconnect()
+		if lm, ok := m.(lifecycleManager); ok {
+			lm.ReconnectContext(ctx)
+		} else {
+			m.Reconnect()
+		}
 
 		mcm.mu.Lock()
 		close(opDone)

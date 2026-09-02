@@ -42,6 +42,16 @@ type Connection interface {
 // StateChannel is the channel we receive state change events on
 type StateChannel chan connectionstate.State
 
+// lifecycleManager extends Manager with context-aware and cancellable operations.
+// Production connectionManager implements this; the coordinator uses it via type assertion.
+type lifecycleManager interface {
+	Manager
+	ConnectContext(context.Context, identity.Identity, common.Address, ProposalLookup, ConnectParams) error
+	CancelCurrentOperation()
+	DisconnectContext(context.Context) error
+	ReconnectContext(context.Context) error
+}
+
 // Manager interface provides methods to manage connection
 type Manager interface {
 	// Connect creates new connection from given consumer to provider, reports error if connection already exists

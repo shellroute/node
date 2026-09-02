@@ -318,6 +318,58 @@ func (m *connectionManager) Connect(consumerID identity.Identity, hermesID commo
 	return nil
 }
 
+// ConnectContext wraps Connect with context cancellation support.
+// If ctx is cancelled during connect, cancels the manager's lifetime context.
+func (m *connectionManager) ConnectContext(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
+	type result struct{ err error }
+	ch := make(chan result, 1)
+	go func() {
+		ch <- result{m.Connect(consumerID, hermesID, proposalLookup, params)}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.err
+	case <-ctx.Done():
+		m.CancelCurrentOperation()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+}
+
+// DisconnectContext waits for disconnect completion or ctx cancellation.
+func (m *connectionManager) DisconnectContext(ctx context.Context) error {
+	type result struct{ err error }
+	ch := make(chan result, 1)
+	go func() {
+		ch <- result{m.Disconnect()}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReconnectContext wraps Reconnect with context and error return.
+func (m *connectionManager) ReconnectContext(ctx context.Context) error {
+	type result struct{}
+	ch := make(chan result, 1)
+	go func() {
+		m.Reconnect()
+		ch <- result{}
+	}()
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		m.CancelCurrentOperation()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+}
+
 func (m *connectionManager) autoReconnect() (err error) {
 	var sessionID session.ID
 
