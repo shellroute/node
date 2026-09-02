@@ -133,6 +133,13 @@ type TimeGetter func() time.Time
 // PaymentEngineFactory creates a new payment issuer from the given params
 type PaymentEngineFactory func(senderUUID string, channel p2p.Channel, consumer, provider identity.Identity, hermes common.Address, proposal proposal.PricedServiceProposal, price market.Price) (PaymentIssuer, error)
 
+// discoAttemptState tracks a single disconnect cleanup attempt.
+// Immutable once done is closed.
+type discoAttemptState struct {
+	done chan struct{}
+	err  error
+}
+
 // ProposalLookup returns a service proposal based on predefined conditions.
 type ProposalLookup func() (proposal *proposal.PricedServiceProposal, err error)
 
@@ -160,8 +167,6 @@ type connectionManager struct {
 	cleanupLock            sync.Mutex
 	cleanup                []func() error
 	cleanupAfterDisconnect []func() error
-	cleanupFinished        chan struct{}
-	cleanupFinishedLock    sync.Mutex
 	acknowledge            func()
 	cancel                 func()
 	channel                p2p.Channel
@@ -169,7 +174,11 @@ type connectionManager struct {
 	preReconnect  func()
 	postReconnect func()
 
-	discoLock      sync.Mutex
+	// Shared disconnect attempt: published atomically with Disconnecting state.
+	// All callers attach to the same attempt. Only one cleanup runs.
+	discoAttemptMu sync.Mutex
+	discoAttempt   *discoAttemptState
+
 	connectOptions ConnectOptions
 
 	activeConnection Connection
@@ -203,7 +212,6 @@ func NewManager(
 		eventBus:             eventBus,
 		paymentEngineFactory: paymentEngineFactory,
 		cleanup:              make([]func() error, 0),
-		cleanupFinished:      make(chan struct{}, 1),
 		ipResolver:           ipResolver,
 		locationResolver:     locationResolver,
 		config:               config,
@@ -244,42 +252,12 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
-	proposal, err := proposalLookup()
-	if err != nil {
-		return fmt.Errorf("failed to lookup proposal: %w", err)
-	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
-	}
-
-	tracer := trace.NewTracer("Consumer whole Connect")
-	defer func() {
-		traceResult := tracer.Finish(m.eventBus, string(sessionID))
-		log.Debug().Msgf("Consumer connection trace: %s", traceResult)
-	}()
-
-	m.addCleanup(func() error {
-		m.clearIPCache()
-		return nil
-	})
-
+	// NotConnected guard FIRST — before any state changes
 	if m.Status().State != connectionstate.NotConnected {
 		return ErrAlreadyExists
 	}
 
-	prc := m.priceFromProposal(*proposal)
-
-	err = m.validator.Validate(m.chainID(), consumerID, prc)
-	if err != nil {
-		return err
-	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
-	}
-
-	// Create lifetime context — separate from caller's ctx.
-	// Caller ctx cancels only during establishment; after success,
-	// the connection lives independently.
+	// Create lifetime context — separate from caller's ctx
 	m.ctxLock.Lock()
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.ctxLock.Unlock()
@@ -289,12 +267,46 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 		m.CancelCurrentOperation()
 	})
 
+	m.addCleanup(func() error {
+		m.clearIPCache()
+		return nil
+	})
+
+	// Proposal lookup — now cancellable via lifetime ctx
+	proposal, err := proposalLookup()
+	if err != nil {
+		stopAfterFunc()
+		return fmt.Errorf("failed to lookup proposal: %w", err)
+	}
+	if ctx.Err() != nil {
+		stopAfterFunc()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
+	tracer := trace.NewTracer("Consumer whole Connect")
+	defer func() {
+		traceResult := tracer.Finish(m.eventBus, string(sessionID))
+		log.Debug().Msgf("Consumer connection trace: %s", traceResult)
+	}()
+
+	prc := m.priceFromProposal(*proposal)
+
+	err = m.validator.Validate(m.chainID(), consumerID, prc)
+	if err != nil {
+		stopAfterFunc()
+		return err
+	}
+	if ctx.Err() != nil {
+		stopAfterFunc()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
 	m.statusConnecting(consumerID, hermesID, *proposal)
 	defer func() {
 		if err != nil {
-			stopAfterFunc() // stop the afterfunc if still pending
+			stopAfterFunc()
 			log.Err(err).Msg("Connect failed, disconnecting")
-			m.disconnect()
+			m.DisconnectContext(context.Background())
 		}
 	}()
 
@@ -350,28 +362,13 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	return nil
 }
 
-// DisconnectContext waits for real disconnect completion. The coordinator
-// calls this via lifecycleManager type assertion.
-func (m *connectionManager) DisconnectContext(ctx context.Context) error {
-	return m.Disconnect()
-}
-
-// ReconnectContext disconnects then reconnects with error reporting.
+// ReconnectContext disconnects then reconnects. Uses DisconnectContext
+// for bounded disconnect, then ConnectContext for the new connection.
 func (m *connectionManager) ReconnectContext(ctx context.Context) error {
-	err := m.Disconnect()
+	err := m.DisconnectContext(ctx)
 	if err != nil && !errors.Is(err, ErrNoConnection) {
 		return err
 	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
-	}
-
-	// Wait for cleanup to complete
-	m.cleanupFinishedLock.Lock()
-	ch := m.cleanupFinished
-	m.cleanupFinishedLock.Unlock()
-	<-ch
-
 	if ctx.Err() != nil {
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
@@ -883,34 +880,58 @@ func (m *connectionManager) CancelCurrentOperation() {
 	}
 }
 
+// Disconnect is the legacy wrapper. Waits unbounded.
 func (m *connectionManager) Disconnect() error {
+	return m.DisconnectContext(context.Background())
+}
+
+// DisconnectContext starts or attaches to the shared disconnect attempt.
+// Returns nil only after cleanup completes. Returns ctx error if caller
+// gives up while cleanup continues (attachable by later callers).
+func (m *connectionManager) DisconnectContext(ctx context.Context) error {
+	m.discoAttemptMu.Lock()
+
+	// Attach to existing attempt
+	if m.discoAttempt != nil {
+		att := m.discoAttempt
+		m.discoAttemptMu.Unlock()
+		select {
+		case <-att.done:
+			return att.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// Check state
 	m.statusLock.Lock()
-	stateWas := m.status.State
-	if stateWas == connectionstate.NotConnected {
+	if m.status.State == connectionstate.NotConnected {
 		m.statusLock.Unlock()
+		m.discoAttemptMu.Unlock()
 		return ErrNoConnection
 	}
-	if stateWas == connectionstate.Disconnecting {
-		// Attach to existing cleanup — read channel under same lock
-		m.cleanupFinishedLock.Lock()
-		ch := m.cleanupFinished
-		m.cleanupFinishedLock.Unlock()
-		m.statusLock.Unlock()
-		<-ch
-		return nil
-	}
-	// Publish completion channel atomically with state transition
-	m.cleanupFinishedLock.Lock()
-	m.cleanupFinished = make(chan struct{})
-	ch := m.cleanupFinished
-	m.cleanupFinishedLock.Unlock()
+
+	// Create attempt + set state atomically
+	att := &discoAttemptState{done: make(chan struct{})}
+	m.discoAttempt = att
+	stateWas := m.status.State
 	m.status.State = connectionstate.Disconnecting
 	m.statusLock.Unlock()
+	m.discoAttemptMu.Unlock()
 
 	log.Info().Msgf("Connection state: %v -> %v", stateWas, connectionstate.Disconnecting)
 	m.publishStateEvent(connectionstate.Disconnecting)
 
-	m.disconnectCleanup(ch)
+	// Run cleanup (only one caller reaches here per attempt)
+	m.runDisconnectCleanup()
+
+	att.err = nil
+	close(att.done)
+
+	// Clear attempt for next cycle
+	m.discoAttemptMu.Lock()
+	m.discoAttempt = nil
+	m.discoAttemptMu.Unlock()
 
 	return nil
 }
@@ -922,22 +943,18 @@ func (m *connectionManager) CheckChannel(ctx context.Context) error {
 	return nil
 }
 
+// disconnect is used by internal callers (Connect error defer, Cancel).
+// Delegates to DisconnectContext with Background.
 func (m *connectionManager) disconnect() {
-	// Legacy path for internal callers (Connect failure defer, Cancel, etc.)
-	m.cleanupFinishedLock.Lock()
-	m.cleanupFinished = make(chan struct{})
-	ch := m.cleanupFinished
-	m.cleanupFinishedLock.Unlock()
-	m.disconnectCleanup(ch)
+	m.DisconnectContext(context.Background())
 }
 
-func (m *connectionManager) disconnectCleanup(done chan struct{}) {
-	m.discoLock.Lock()
-	defer m.discoLock.Unlock()
-	defer close(done)
-
+// runDisconnectCleanup does the actual cleanup work. Called exactly once per attempt.
+func (m *connectionManager) runDisconnectCleanup() {
 	m.ctxLock.Lock()
-	m.cancel()
+	if m.cancel != nil {
+		m.cancel()
+	}
 	m.ctxLock.Unlock()
 
 	m.cleanConnection()
