@@ -351,15 +351,11 @@ func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *po
 // retireEntry runs cleanup on an entry's manager. Waits for any in-flight
 // operation (Connect/Reconnect) to finish first. Only one cleanup per entry.
 func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
-	// Wait for the operation to finish before disconnecting
-	if entry.operationDone != nil {
-		<-entry.operationDone
-	}
-
+	// Claim cleanup ownership under lock first — prevents double cleanup
 	mcm.mu.Lock()
-	if entry.cleanupRunning {
+	if entry.cleanupRunning || entry.cleanupDone != nil {
 		mcm.mu.Unlock()
-		return
+		return // already started or completed
 	}
 	if entry.manager == nil {
 		// Reserved but never filled — nothing to clean
@@ -373,6 +369,11 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 	entry.cleanupDone = done
 	mcm.stateChanged()
 	mcm.mu.Unlock()
+
+	// Wait for the operation to finish before disconnecting
+	if entry.operationDone != nil {
+		<-entry.operationDone
+	}
 
 	err := entry.manager.Disconnect()
 
