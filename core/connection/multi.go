@@ -444,10 +444,13 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
 
-	// Cancel in-flight operations
+	// Collect managers under lock, cancel outside
 	mcm.mu.Lock()
+	var toCancel []Manager
 	for _, e := range mcm.retiring {
-		mcm.cancelManager(e.manager)
+		if e.manager != nil {
+			toCancel = append(toCancel, e.manager)
+		}
 	}
 	// Start missing cleanup attempts
 	for _, e := range mcm.retiring {
@@ -456,6 +459,9 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 		}
 	}
 	mcm.mu.Unlock()
+	for _, m := range toCancel {
+		mcm.cancelManager(m)
+	}
 
 	deadline := time.After(mcm.BulkTimeout)
 	for {

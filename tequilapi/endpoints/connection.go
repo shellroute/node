@@ -18,6 +18,7 @@
 package endpoints
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -207,7 +208,7 @@ func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 
 	err = ce.manager.Connect(c.Request.Context(), consumerID, common.HexToAddress(cr.HermesID), proposalLookup, getConnectOptions(cr))
 	if err != nil {
-		if errors.Is(err, connection.ErrLifecycleBusy) {
+		if errors.Is(err, connection.ErrLifecycleBusy) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			c.Error(apierror.ServiceUnavailable())
 			return
 		}
@@ -272,7 +273,9 @@ func (ce *ConnectionEndpoint) Kill(c *gin.Context) {
 		switch {
 		case errors.Is(err, connection.ErrNoConnection):
 			c.Error(apierror.Unprocessable("No connection exists", contract.ErrCodeNoConnectionExists))
-		case errors.Is(err, connection.ErrLifecycleBusy):
+		case errors.Is(err, connection.ErrLifecycleBusy),
+			errors.Is(err, context.DeadlineExceeded),
+			errors.Is(err, context.Canceled):
 			c.Error(apierror.ServiceUnavailable())
 		default:
 			c.Error(apierror.Internal("Could not disconnect: "+err.Error(), contract.ErrCodeDisconnect))
