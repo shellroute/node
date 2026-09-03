@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
+	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/identity"
 )
 
@@ -147,11 +148,14 @@ func TestBulkCancelsReconnectBeforeFreshConnect(t *testing.T) {
 }
 
 // slowConnectManager blocks on connectGate during ConnectContext, allowing
-// concurrent Stats calls to hit the connecting phase.
+// concurrent Stats calls to hit the connecting phase. Stats panics unless
+// the manager has been explicitly activated — proves the phase gate works.
 type slowConnectManager struct {
 	mockManager
 	connectGate    chan struct{}
 	connectEntered chan struct{} // closed when ConnectContext blocks
+	activated      atomic.Bool   // set after connect succeeds
+	statsCalls     atomic.Int32  // counts Stats invocations
 }
 
 func (m *slowConnectManager) ConnectContext(ctx context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
@@ -161,6 +165,7 @@ func (m *slowConnectManager) ConnectContext(ctx context.Context, _ identity.Iden
 		m.mu.Lock()
 		m.connected = true
 		m.mu.Unlock()
+		m.activated.Store(true)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -172,14 +177,25 @@ func (m *slowConnectManager) DisconnectContext(_ context.Context) error {
 }
 func (m *slowConnectManager) ReconnectContext(_ context.Context) error { return nil }
 
+func (m *slowConnectManager) Stats() connectionstate.Statistics {
+	if !m.activated.Load() {
+		panic("Stats called on non-activated manager")
+	}
+	m.statsCalls.Add(1)
+	return connectionstate.Statistics{BytesReceived: 42}
+}
+
 func TestStatsSafeDuringConnect(t *testing.T) {
 	connectGate := make(chan struct{})
 	connectEntered := make(chan struct{})
+	var mgr *slowConnectManager
 	mcm := NewMultiConnectionManager(func() Manager {
-		return &slowConnectManager{
+		m := &slowConnectManager{
 			connectGate:    connectGate,
 			connectEntered: connectEntered,
 		}
+		mgr = m
+		return m
 	})
 
 	// Start connect — blocks in ConnectContext
@@ -195,15 +211,18 @@ func TestStatsSafeDuringConnect(t *testing.T) {
 		t.Fatal("connect did not enter blocking phase")
 	}
 
-	// Concurrent Stats must return zero without race/panic
+	// Stats during connecting must NOT reach the manager (would panic)
 	stats := mcm.Stats(100)
 	if stats.BytesReceived != 0 || stats.BytesSent != 0 {
 		t.Errorf("stats during connecting should be zero, got %+v", stats)
 	}
+	if n := mgr.statsCalls.Load(); n != 0 {
+		t.Errorf("Stats should not have been called during connecting, got %d calls", n)
+	}
 
 	// Status is safe during any phase
 	status := mcm.Status(100)
-	_ = status // no panic = pass
+	_ = status
 
 	// Unblock connect
 	close(connectGate)
@@ -216,7 +235,12 @@ func TestStatsSafeDuringConnect(t *testing.T) {
 		t.Fatal("connect did not complete")
 	}
 
-	// After active, Stats should work normally
+	// After active, Stats reaches the manager and returns real data
 	stats = mcm.Stats(100)
-	_ = stats // no panic = pass
+	if stats.BytesReceived != 42 {
+		t.Errorf("stats after active should return manager data, got %+v", stats)
+	}
+	if n := mgr.statsCalls.Load(); n != 1 {
+		t.Errorf("Stats should have been called once after active, got %d", n)
+	}
 }
