@@ -86,7 +86,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 			Dur("elapsed", time.Since(start)).Msg("Connect finished")
 	}()
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
 	// Reserve port atomically before creating manager
@@ -313,7 +313,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retEr
 			Dur("elapsed", time.Since(start)).Msg("Reconnect finished")
 	}()
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
 	mcm.mu.Lock()
@@ -323,6 +323,10 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retEr
 	}
 	e, ok := mcm.current[id]
 	if !ok {
+		if _, retiring := mcm.retiring[id]; retiring {
+			mcm.mu.Unlock()
+			return ErrLifecycleBusy
+		}
 		mcm.mu.Unlock()
 		return ErrNoConnection
 	}

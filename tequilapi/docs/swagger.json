@@ -402,6 +402,12 @@
             "schema": {
               "$ref": "#/definitions/APIError"
             }
+          },
+          "503": {
+            "description": "Lifecycle busy or request cancelled",
+            "schema": {
+              "$ref": "#/definitions/APIError"
+            }
           }
         }
       },
@@ -430,6 +436,12 @@
           },
           "500": {
             "description": "Internal server error",
+            "schema": {
+              "$ref": "#/definitions/APIError"
+            }
+          },
+          "503": {
+            "description": "Lifecycle busy or request cancelled",
             "schema": {
               "$ref": "#/definitions/APIError"
             }

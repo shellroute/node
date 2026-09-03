@@ -268,10 +268,15 @@ func TestConnectRejectsRetiringPort(t *testing.T) {
 
 func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 	gate := make(chan struct{})
+	managerCreated := make(chan struct{}, 1)
 	created := &managersSlice{}
 	mcm := NewMultiConnectionManager(func() Manager {
 		m := &mockManager{connectGate: gate}
 		created.add(m)
+		select {
+		case managerCreated <- struct{}{}:
+		default:
+		}
 		return m
 	})
 	mcm.BulkTimeout = 5 * time.Second
@@ -281,8 +286,10 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 	}()
 
-	// Wait for manager to be created
-	for created.len() == 0 {
+	select {
+	case <-managerCreated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager was not created")
 	}
 
 	bulkDone := make(chan error, 1)
@@ -290,40 +297,46 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 		bulkDone <- mcm.Disconnect(bg(), -1)
 	}()
 
-	// Let bulk advance generation, then unblock connect
-	time.Sleep(50 * time.Millisecond)
+	// Bulk sets reconcileRequired under lock; unblock connect after bulk starts
+	// by waiting for bulk to change state (notify channel)
+	wait := mcm.waitNotify()
+	select {
+	case <-wait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bulk did not start")
+	}
 	close(gate)
 
 	connectErr := <-connectDone
 	bulkErr := <-bulkDone
 
-	// Connect should fail (superseded by bulk) or be cancelled
 	if connectErr == nil {
 		t.Error("connect should fail when superseded by bulk")
 	}
-	// Bulk should succeed (manager unblocked)
 	if bulkErr != nil {
 		t.Errorf("bulk disconnect should succeed, got %v", bulkErr)
 	}
-
-	// Nothing should be in current
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("current should be empty, got %d", n)
 	}
-
-	// Manager should be disconnected
-	time.Sleep(100 * time.Millisecond)
-	if created.get(0).disconnCount.Load() == 0 {
-		t.Error("stale manager should have been disconnected")
+	if created.get(0).disconnCount.Load() < 1 {
+		t.Error("stale manager should have been disconnected at least once")
 	}
 }
 
 func TestBulkSingleFlight(t *testing.T) {
+	gate := make(chan struct{})
 	mcm, _ := newTestMulti()
 	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 
-	var wg sync.WaitGroup
+	// Replace with blocking disconnect manager to control timing
+	blockingMgr := &blockingDisconnectManager{gate: gate}
+	mcm.mu.Lock()
+	mcm.current[100].manager = blockingMgr
+	mcm.mu.Unlock()
+
 	errs := make([]error, 3)
+	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
 		go func(idx int) {
@@ -331,13 +344,24 @@ func TestBulkSingleFlight(t *testing.T) {
 			errs[idx] = mcm.Disconnect(bg(), -1)
 		}(i)
 	}
+
+	// Wait for bulk to start
+	wait := mcm.waitNotify()
+	select {
+	case <-wait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bulk did not start")
+	}
+	close(gate)
 	wg.Wait()
 
-	// All should succeed (shared operation)
 	for i, err := range errs {
 		if err != nil {
 			t.Errorf("caller %d got error: %v", i, err)
 		}
+	}
+	if n := blockingMgr.disconnCount.Load(); n != 1 {
+		t.Errorf("expected exactly 1 Manager.Disconnect call, got %d", n)
 	}
 }
 

@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2024 The "MysteriumNetwork/node" Authors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 package connection
 
 import (
@@ -8,9 +25,11 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/stretchr/testify/require"
 
 	"github.com/mysteriumnetwork/node/core/connection/connectionstate"
 	"github.com/mysteriumnetwork/node/core/discovery/proposal"
+	"github.com/mysteriumnetwork/node/eventbus"
 	"github.com/mysteriumnetwork/node/identity"
 	"github.com/mysteriumnetwork/node/mocks"
 )
@@ -111,30 +130,41 @@ func TestDisconnectContextSharesRunningCleanup(t *testing.T) {
 	}
 }
 
-func TestConnectContextPreservesCallerCancellationFromLookup(t *testing.T) {
-	// Uses a bare connectionManager with a blocking lookup to verify
-	// that cancellation during establishment preserves both
-	// ErrConnectionCancelled and the concrete ctx error for 503 mapping.
-	started := make(chan struct{})
-	release := make(chan struct{})
-	m := &connectionManager{
-		status:   connectionstate.Status{State: connectionstate.NotConnected},
-		eventBus: mocks.NewEventBus(),
-	}
-	lookup := func() (*proposal.PricedServiceProposal, error) {
-		close(started)
-		<-release
-		return &proposal.PricedServiceProposal{}, nil
-	}
+func TestConnectContextPreservesCallerCancellationFromWait(t *testing.T) {
+	tc := &testContext{}
+	tc.SetT(t)
+	tc.SetupTest()
+	// Empty states — Start returns but waitForConnectedState blocks on open channel
+	tc.fakeConnectionFactory.mockConnection.onStartReportStates = []fakeState{}
+
+	// Use real eventbus so Subscribe actually fires
+	bus := eventbus.New()
+	tc.connManager.eventBus = bus
+
+	connecting := make(chan struct{}, 1)
+	require.NoError(t, bus.Subscribe(connectionstate.AppTopicConnectionState, func(ev connectionstate.AppEventConnectionState) {
+		if ev.State == connectionstate.Connecting {
+			select {
+			case connecting <- struct{}{}:
+			default:
+			}
+		}
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- m.ConnectContext(ctx, identity.Identity{}, common.Address{}, lookup, ConnectParams{})
+		done <- tc.connManager.ConnectContext(ctx, consumerID, hermesID, activeProposalLookup, ConnectParams{})
 	}()
-	<-started
+
+	select {
+	case <-connecting:
+	case err := <-done:
+		t.Fatalf("ConnectContext returned before Connecting: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("never entered connecting state")
+	}
 	cancel()
-	close(release)
 
 	select {
 	case err := <-done:

@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2024 The "MysteriumNetwork/node" Authors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 package connection
 
 import (
@@ -278,10 +295,13 @@ func TestConcurrentSamePortConnect(t *testing.T) {
 
 func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	gate := make(chan struct{})
-	created := &managersSlice{}
+	managerCreated := make(chan struct{}, 1)
 	mcm := NewMultiConnectionManager(func() Manager {
 		m := &mockManager{connectGate: gate}
-		created.add(m)
+		select {
+		case managerCreated <- struct{}{}:
+		default:
+		}
 		return m
 	})
 
@@ -289,11 +309,9 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	go func() {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
-	// Wait for connect to block on gate — once Connect returns or manager is
-	// created, we know it's inside. Short sleep is acceptable here because the
-	// gate controls determinism, not the sleep.
-	time.Sleep(50 * time.Millisecond)
-	if created.len() == 0 {
+	select {
+	case <-managerCreated:
+	case <-time.After(5 * time.Second):
 		t.Fatal("manager was not created")
 	}
 
@@ -467,6 +485,7 @@ type blockingDisconnectManager struct {
 }
 
 func (m *blockingDisconnectManager) Disconnect() error {
+	m.disconnCount.Add(1)
 	<-m.gate
 	return nil
 }
@@ -666,5 +685,54 @@ func TestIndividualDisconnectRetriesFailedCleanup(t *testing.T) {
 	// Entry should be fully removed
 	if n := retiringLen(mcm); n != 0 {
 		t.Errorf("retiring should be empty, got %d", n)
+	}
+}
+
+// --- Pre-canceled context tests ---
+
+func TestPreCanceledConnectWrapsError(t *testing.T) {
+	mcm, created := newTestMulti()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := mcm.Connect(ctx, dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	if !errors.Is(err, ErrConnectionCancelled) {
+		t.Errorf("expected ErrConnectionCancelled, got %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	if created.len() != 0 {
+		t.Errorf("no manager should be created, got %d", created.len())
+	}
+}
+
+func TestPreCanceledReconnectWrapsError(t *testing.T) {
+	mcm, _ := newTestMulti()
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := mcm.Reconnect(ctx, 100)
+	if !errors.Is(err, ErrConnectionCancelled) {
+		t.Errorf("expected ErrConnectionCancelled, got %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// --- Reconnect checks retiring port ---
+
+func TestReconnectRejectsRetiringPort(t *testing.T) {
+	mcm, _ := newTestMulti()
+	mcm.mu.Lock()
+	mcm.retiring[100] = &portEntry{port: 100}
+	mcm.mu.Unlock()
+
+	err := mcm.Reconnect(bg(), 100)
+	if !errors.Is(err, ErrLifecycleBusy) {
+		t.Errorf("expected ErrLifecycleBusy for retiring port, got %v", err)
 	}
 }
