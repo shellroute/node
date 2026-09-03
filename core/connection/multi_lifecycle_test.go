@@ -341,8 +341,8 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 		t.Fatal("disconnect did not complete")
 	}
 
-	// Wait for retirement to complete
-	time.Sleep(50 * time.Millisecond)
+	// Authoritative cleanup to wait for async retirement
+	mcm.Disconnect(bg(), -1)
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("current should be empty, got %d", n)
 	}
@@ -604,7 +604,8 @@ func TestReconnectPropagatesError(t *testing.T) {
 		t.Errorf("expected %v, got %v", wantErr, err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	// Authoritative cleanup to wait for async retirement
+	mcm.Disconnect(bg(), -1)
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("failed reconnect should remove from current, got %d", n)
 	}

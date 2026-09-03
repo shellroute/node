@@ -181,8 +181,8 @@ func TestFailedConnectNotRegistered(t *testing.T) {
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("failed connect should not register, got %d", n)
 	}
-	// Wait for retirement goroutine
-	time.Sleep(50 * time.Millisecond)
+	// Authoritative cleanup to wait for async retirement
+	mcm.Disconnect(bg(), -1)
 	if n := retiringLen(mcm); n != 0 {
 		t.Errorf("failed connect should retire cleanly, got %d retiring", n)
 	}
@@ -383,7 +383,13 @@ func TestBulkSingleFlight(t *testing.T) {
 }
 
 func TestTwoUnrelatedPortsConcurrent(t *testing.T) {
-	mcm, _ := newTestMulti()
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &mockManager{connectGate: gate}
+		entered <- struct{}{}
+		return m
+	})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -395,6 +401,19 @@ func TestTwoUnrelatedPortsConcurrent(t *testing.T) {
 		defer wg.Done()
 		mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
+
+	// Both managers must be created before release — proves concurrency
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first manager not created")
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second manager not created")
+	}
+	close(gate)
 	wg.Wait()
 
 	if n := registryLen(mcm); n != 2 {
@@ -420,7 +439,12 @@ func TestConnectAfterBulkSurvives(t *testing.T) {
 
 func TestConnectCancellation(t *testing.T) {
 	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
 	mcm := NewMultiConnectionManager(func() Manager {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
 		return &mockManager{connectGate: gate}
 	})
 
@@ -431,7 +455,11 @@ func TestConnectCancellation(t *testing.T) {
 		connectDone <- mcm.Connect(ctx, dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager not created")
+	}
 	cancel()
 
 	err := <-connectDone
