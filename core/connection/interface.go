@@ -84,3 +84,10 @@ type MultiManager interface {
 	// Reconnect reconnects current session
 	Reconnect(ctx context.Context, id int) error
 }
+
+// Compile-time interface assertions — prevent signature drift from
+// silently selecting the legacy Manager fallback path.
+var (
+	_ lifecycleManager = (*connectionManager)(nil)
+	_ MultiManager     = (*multiConnectionManager)(nil)
+)
