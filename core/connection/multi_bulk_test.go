@@ -111,15 +111,42 @@ func TestGatewayRetryAfterTimeout(t *testing.T) {
 		t.Fatal("Disconnect never entered")
 	}
 
+	// Connect should fail while unresolved
+	err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
+	if !errors.Is(err, ErrLifecycleBusy) {
+		t.Errorf("connect during unresolved reconciliation should return ErrLifecycleBusy, got %v", err)
+	}
+
+	// Retry — wait for activeBulk to be installed before releasing
 	retryDone := make(chan error, 1)
 	go func() { retryDone <- mcm.Disconnect(bg(), -1) }()
 
+	deadline := time.After(5 * time.Second)
+	for {
+		wait := mcm.waitNotify()
+		mcm.mu.Lock()
+		hasBulk := mcm.activeBulk != nil
+		mcm.mu.Unlock()
+		if hasBulk {
+			break
+		}
+		select {
+		case <-wait:
+		case <-deadline:
+			t.Fatal("retry did not install activeBulk")
+		}
+	}
+
+	// Assert no duplicate cleanup before release
+	if n := mgr.disconnCount.Load(); n != 1 {
+		t.Errorf("before release: expected 1 cleanup call, got %d", n)
+	}
 	close(gate)
 
 	select {
-	case err := <-retryDone:
-		if err != nil {
-			t.Errorf("retry should succeed, got %v", err)
+	case retryErr := <-retryDone:
+		if retryErr != nil {
+			t.Errorf("retry should succeed, got %v", retryErr)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("retry did not complete")
@@ -133,6 +160,11 @@ func TestGatewayRetryAfterTimeout(t *testing.T) {
 	}
 	if n := retiringLen(mcm); n != 0 {
 		t.Errorf("retiring should be empty, got %d", n)
+	}
+
+	// Connect should succeed after reconciliation
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
+		t.Errorf("connect after reconciliation should work, got %v", err)
 	}
 }
 
@@ -393,8 +425,26 @@ func TestCallerDeadlineServerContinues(t *testing.T) {
 		t.Fatal("leader did not time out")
 	}
 
+	// Retry attaches to server-side cleanup that's still running.
+	// Wait for retry to observe activeBulk before releasing gate.
 	retryDone := make(chan error, 1)
 	go func() { retryDone <- mcm.Disconnect(bg(), -1) }()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		wait := mcm.waitNotify()
+		mcm.mu.Lock()
+		hasBulk := mcm.activeBulk != nil
+		mcm.mu.Unlock()
+		if hasBulk {
+			break
+		}
+		select {
+		case <-wait:
+		case <-deadline:
+			t.Fatal("retry did not install activeBulk")
+		}
+	}
 
 	close(gate)
 

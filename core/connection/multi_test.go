@@ -293,15 +293,11 @@ func TestConnectRejectsRetiringPort(t *testing.T) {
 
 func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 	gate := make(chan struct{})
-	managerCreated := make(chan struct{}, 1)
+	connectEntered := make(chan struct{})
 	created := &managersSlice{}
 	mcm := NewMultiConnectionManager(func() Manager {
-		m := &mockManager{connectGate: gate}
+		m := &mockManager{connectGate: gate, connectEntered: connectEntered}
 		created.add(m)
-		select {
-		case managerCreated <- struct{}{}:
-		default:
-		}
 		return m
 	})
 	mcm.BulkTimeout = 5 * time.Second
@@ -311,10 +307,11 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 	}()
 
+	// Wait for Manager.Connect to be entered (not just factory)
 	select {
-	case <-managerCreated:
+	case <-connectEntered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("manager was not created")
+		t.Fatal("Connect not entered")
 	}
 
 	bulkDone := make(chan error, 1)
@@ -322,13 +319,21 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 		bulkDone <- mcm.Disconnect(bg(), -1)
 	}()
 
-	// Bulk sets reconcileRequired under lock; unblock connect after bulk starts
-	// by waiting for bulk to change state (notify channel)
-	wait := mcm.waitNotify()
-	select {
-	case <-wait:
-	case <-time.After(5 * time.Second):
-		t.Fatal("bulk did not start")
+	// Wait until entry is in retiring under lock — predicate loop
+	deadline := time.After(5 * time.Second)
+	for {
+		wait := mcm.waitNotify()
+		mcm.mu.Lock()
+		_, retiring := mcm.retiring[100]
+		mcm.mu.Unlock()
+		if retiring {
+			break
+		}
+		select {
+		case <-wait:
+		case <-deadline:
+			t.Fatal("entry never reached retiring")
+		}
 	}
 	close(gate)
 
@@ -372,12 +377,24 @@ func TestBulkSingleFlight(t *testing.T) {
 		t.Fatal("Disconnect not entered")
 	}
 
-	// Start two joiners — they attach to the active bulk
+	// Start two joiners. Since activeBulk is already installed (leader is
+	// blocking in Disconnect), joiners take the fast attach path: lock mu,
+	// see activeBulk != nil, unlock, and select on bulk.done. The Disconnect
+	// call to the underlying manager is blocked on gate, so bulk.done cannot
+	// close until we release. Any joiner that reaches select before release
+	// will correctly wait.
 	wg.Add(2)
 	go func() { defer wg.Done(); errs[1] = mcm.Disconnect(bg(), -1) }()
 	go func() { defer wg.Done(); errs[2] = mcm.Disconnect(bg(), -1) }()
 
-	// Release cleanup
+	// Verify activeBulk is installed (proves joiners have a bulk to attach to)
+	mcm.mu.Lock()
+	if mcm.activeBulk == nil {
+		mcm.mu.Unlock()
+		t.Fatal("activeBulk should exist while leader is blocked")
+	}
+	mcm.mu.Unlock()
+
 	close(gate)
 	wg.Wait()
 
