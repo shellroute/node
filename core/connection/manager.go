@@ -274,9 +274,10 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 		if err != nil {
 			stopAfterFunc()
 			lifetimeCancel()
-			// Normalize cancellation errors so TequilAPI maps 503 not 422
-			if ctx.Err() != nil && !errors.Is(err, ErrConnectionCancelled) {
-				err = fmt.Errorf("%w: %w", ErrConnectionCancelled, errors.Join(err, ctx.Err()))
+			// Normalize cancellation: ensure both ErrConnectionCancelled and
+			// the concrete ctx error are present so TequilAPI maps 503.
+			if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+				err = fmt.Errorf("%w: %w", ErrConnectionCancelled, errors.Join(err, ctxErr))
 			}
 			log.Err(err).Msg("Connect failed, disconnecting")
 			m.DisconnectContext(context.Background())
