@@ -344,39 +344,40 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("current should be empty, got %d", n)
 	}
-	if created.get(0).disconnCount.Load() < 1 {
-		t.Error("stale manager should have been disconnected at least once")
+	if n := created.get(0).disconnCount.Load(); n != 1 {
+		t.Errorf("stale manager should have been disconnected exactly once, got %d", n)
 	}
 }
 
 func TestBulkSingleFlight(t *testing.T) {
 	gate := make(chan struct{})
+	disconnectEntered := make(chan struct{})
 	mcm, _ := newTestMulti()
 	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
 
-	// Replace with blocking disconnect manager to control timing
-	blockingMgr := &blockingDisconnectManager{gate: gate}
+	blockingMgr := &blockingDisconnectManager{gate: gate, disconnectEntered: disconnectEntered}
 	mcm.mu.Lock()
 	mcm.current[100].manager = blockingMgr
 	mcm.mu.Unlock()
 
+	// Start leader — wait for low-level Disconnect to be entered
 	errs := make([]error, 3)
 	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			errs[idx] = mcm.Disconnect(bg(), -1)
-		}(i)
+	wg.Add(1)
+	go func() { defer wg.Done(); errs[0] = mcm.Disconnect(bg(), -1) }()
+
+	select {
+	case <-disconnectEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect not entered")
 	}
 
-	// Wait for bulk to start
-	wait := mcm.waitNotify()
-	select {
-	case <-wait:
-	case <-time.After(5 * time.Second):
-		t.Fatal("bulk did not start")
-	}
+	// Start two joiners — they attach to the active bulk
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[1] = mcm.Disconnect(bg(), -1) }()
+	go func() { defer wg.Done(); errs[2] = mcm.Disconnect(bg(), -1) }()
+
+	// Release cleanup
 	close(gate)
 	wg.Wait()
 

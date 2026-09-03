@@ -295,13 +295,11 @@ func TestConcurrentSamePortConnect(t *testing.T) {
 
 func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	gate := make(chan struct{})
-	managerCreated := make(chan struct{}, 1)
+	connectEntered := make(chan struct{})
+	created := &managersSlice{}
 	mcm := NewMultiConnectionManager(func() Manager {
-		m := &mockManager{connectGate: gate}
-		select {
-		case managerCreated <- struct{}{}:
-		default:
-		}
+		m := &mockManager{connectGate: gate, connectEntered: connectEntered}
+		created.add(m)
 		return m
 	})
 
@@ -309,10 +307,11 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	go func() {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
+	// Wait for Manager.Connect to be entered (not just factory)
 	select {
-	case <-managerCreated:
+	case <-connectEntered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("manager was not created")
+		t.Fatal("Connect not entered")
 	}
 
 	discDone := make(chan error, 1)
@@ -320,13 +319,28 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 		discDone <- mcm.Disconnect(bg(), 200)
 	}()
 
+	// Wait until entry is in retiring before releasing gate
+	deadline := time.After(5 * time.Second)
+	for {
+		wait := mcm.waitNotify()
+		mcm.mu.Lock()
+		_, retiring := mcm.retiring[200]
+		mcm.mu.Unlock()
+		if retiring {
+			break
+		}
+		select {
+		case <-wait:
+		case <-deadline:
+			t.Fatal("entry never reached retiring")
+		}
+	}
 	close(gate)
 
 	select {
 	case connectErr := <-connectDone:
-		// Connect may succeed or be cancelled by disconnect — both acceptable
-		if connectErr != nil && !errors.Is(connectErr, ErrConnectionCancelled) && !errors.Is(connectErr, ErrLifecycleBusy) {
-			t.Errorf("connect: unexpected error %v", connectErr)
+		if connectErr == nil {
+			t.Error("connect should fail when disconnect is pending")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("connect did not complete")
@@ -335,14 +349,15 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	select {
 	case discErr := <-discDone:
 		if discErr != nil {
-			t.Errorf("disconnect: unexpected error %v", discErr)
+			t.Errorf("disconnect should succeed, got %v", discErr)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("disconnect did not complete")
 	}
 
-	// Authoritative cleanup to wait for async retirement
-	mcm.Disconnect(bg(), -1)
+	if n := created.get(0).disconnCount.Load(); n != 1 {
+		t.Errorf("cleanup should run exactly once, got %d", n)
+	}
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("current should be empty, got %d", n)
 	}
@@ -473,267 +488,5 @@ func TestRaceStressConnectDisconnect(t *testing.T) {
 	}
 	if n := retiringLen(mcm); n != 0 {
 		t.Errorf("retiring should be empty after stress, got %d", n)
-	}
-}
-
-// --- Bulk timeout and retry tests ---
-
-// blockingDisconnectManager blocks on Disconnect until gate is closed
-type blockingDisconnectManager struct {
-	mockManager
-	gate chan struct{}
-}
-
-func (m *blockingDisconnectManager) Disconnect() error {
-	m.disconnCount.Add(1)
-	<-m.gate
-	return nil
-}
-
-func TestBulkTimeoutReturnsFalse(t *testing.T) {
-	gate := make(chan struct{})
-	mcm := NewMultiConnectionManager(func() Manager {
-		return &mockManager{}
-	})
-	mcm.BulkTimeout = 100 * time.Millisecond
-
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-
-	blockingMgr := &blockingDisconnectManager{gate: gate}
-	mcm.mu.Lock()
-	mcm.current[100].manager = blockingMgr
-	mcm.mu.Unlock()
-
-	err := mcm.Disconnect(bg(), -1)
-	close(gate)
-
-	if err == nil {
-		t.Error("bulk timeout should return error")
-	}
-
-	mcm.mu.Lock()
-	reconcileRequired := mcm.reconcileRequired
-	mcm.mu.Unlock()
-	if !reconcileRequired {
-		t.Error("reconcileRequired should remain true after timeout")
-	}
-}
-
-func TestGatewayRetryAfterTimeout(t *testing.T) {
-	gate := make(chan struct{})
-	mcm := NewMultiConnectionManager(func() Manager {
-		return &blockingDisconnectManager{gate: gate}
-	})
-	mcm.BulkTimeout = 100 * time.Millisecond
-
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-
-	err1 := mcm.Disconnect(bg(), -1)
-	if err1 == nil {
-		t.Fatal("first bulk should timeout")
-	}
-	if !errors.Is(err1, ErrLifecycleBusy) {
-		t.Errorf("expected ErrLifecycleBusy, got %v", err1)
-	}
-
-	err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
-	if !errors.Is(err, ErrLifecycleBusy) {
-		t.Errorf("connect during unresolved reconciliation should return ErrLifecycleBusy, got %v", err)
-	}
-
-	close(gate)
-
-	err2 := mcm.Disconnect(bg(), -1)
-	if err2 != nil {
-		t.Errorf("second bulk should succeed, got %v", err2)
-	}
-
-	if n := registryLen(mcm); n != 0 {
-		t.Errorf("current should be empty, got %d", n)
-	}
-	if n := retiringLen(mcm); n != 0 {
-		t.Errorf("retiring should be empty, got %d", n)
-	}
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
-		t.Errorf("connect after resolved reconciliation should work, got %v", err)
-	}
-}
-
-// --- Reconnect tests ---
-
-type reconnectableManager struct {
-	mockManager
-	reconnectErr error
-}
-
-func (m *reconnectableManager) ConnectContext(_ context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
-	return m.Connect(identity.Identity{}, common.Address{}, nil, ConnectParams{})
-}
-func (m *reconnectableManager) CancelCurrentOperation() {}
-func (m *reconnectableManager) DisconnectContext(_ context.Context) error {
-	return m.Disconnect()
-}
-func (m *reconnectableManager) ReconnectContext(_ context.Context) error {
-	return m.reconnectErr
-}
-
-func TestReconnectPropagatesError(t *testing.T) {
-	wantErr := errors.New("reconnect failed")
-	created := &managersSlice{}
-	mcm := NewMultiConnectionManager(func() Manager {
-		m := &reconnectableManager{}
-		created.add(&m.mockManager)
-		return m
-	})
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-
-	mcm.mu.Lock()
-	rm := mcm.current[100].manager.(*reconnectableManager)
-	rm.reconnectErr = wantErr
-	mcm.mu.Unlock()
-
-	err := mcm.Reconnect(bg(), 100)
-	if err == nil {
-		t.Fatal("expected error from failed reconnect")
-	}
-	if !errors.Is(err, wantErr) {
-		t.Errorf("expected %v, got %v", wantErr, err)
-	}
-
-	// Authoritative cleanup to wait for async retirement
-	mcm.Disconnect(bg(), -1)
-	if n := registryLen(mcm); n != 0 {
-		t.Errorf("failed reconnect should remove from current, got %d", n)
-	}
-}
-
-func TestReconnectSucceeds(t *testing.T) {
-	mcm := NewMultiConnectionManager(func() Manager {
-		return &reconnectableManager{}
-	})
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-
-	if err := mcm.Reconnect(bg(), 100); err != nil {
-		t.Errorf("reconnect should succeed, got %v", err)
-	}
-
-	if n := registryLen(mcm); n != 1 {
-		t.Errorf("expected 1 current entry, got %d", n)
-	}
-}
-
-// --- Invariant 7: individual disconnect retries failed cleanup ---
-
-// failOnceManager fails Disconnect once, then succeeds.
-type failOnceManager struct {
-	mockManager
-	calls atomic.Int32
-}
-
-func (m *failOnceManager) Disconnect() error {
-	n := m.calls.Add(1)
-	if n == 1 {
-		return errors.New("transient cleanup error")
-	}
-	m.mu.Lock()
-	m.connected = false
-	m.mu.Unlock()
-	return nil
-}
-
-func TestIndividualDisconnectRetriesFailedCleanup(t *testing.T) {
-	var mgr *failOnceManager
-	mcm := NewMultiConnectionManager(func() Manager {
-		m := &failOnceManager{}
-		mgr = m
-		return m
-	})
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-
-	// First disconnect — cleanup fails
-	err1 := mcm.Disconnect(bg(), 100)
-	if err1 == nil {
-		t.Fatal("first disconnect should fail")
-	}
-	if mgr.calls.Load() != 1 {
-		t.Fatalf("expected 1 cleanup call, got %d", mgr.calls.Load())
-	}
-
-	// Entry should still be retiring (not removed)
-	if n := retiringLen(mcm); n != 1 {
-		t.Fatalf("entry should remain retiring, got %d", n)
-	}
-
-	// Second disconnect — retry succeeds
-	err2 := mcm.Disconnect(bg(), 100)
-	if err2 != nil {
-		t.Errorf("second disconnect should succeed, got %v", err2)
-	}
-	if mgr.calls.Load() != 2 {
-		t.Errorf("expected 2 cleanup calls, got %d", mgr.calls.Load())
-	}
-
-	// Entry should be fully removed
-	if n := retiringLen(mcm); n != 0 {
-		t.Errorf("retiring should be empty, got %d", n)
-	}
-}
-
-// --- Pre-canceled context tests ---
-
-func TestPreCanceledConnectWrapsError(t *testing.T) {
-	mcm, created := newTestMulti()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := mcm.Connect(ctx, dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-	if !errors.Is(err, ErrConnectionCancelled) {
-		t.Errorf("expected ErrConnectionCancelled, got %v", err)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-	if created.len() != 0 {
-		t.Errorf("no manager should be created, got %d", created.len())
-	}
-}
-
-func TestPreCanceledReconnectWrapsError(t *testing.T) {
-	mcm, _ := newTestMulti()
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := mcm.Reconnect(ctx, 100)
-	if !errors.Is(err, ErrConnectionCancelled) {
-		t.Errorf("expected ErrConnectionCancelled, got %v", err)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-// --- Reconnect checks retiring port ---
-
-func TestReconnectRejectsRetiringPort(t *testing.T) {
-	mcm, _ := newTestMulti()
-	mcm.mu.Lock()
-	mcm.retiring[100] = &portEntry{port: 100}
-	mcm.mu.Unlock()
-
-	err := mcm.Reconnect(bg(), 100)
-	if !errors.Is(err, ErrLifecycleBusy) {
-		t.Errorf("expected ErrLifecycleBusy for retiring port, got %v", err)
 	}
 }
