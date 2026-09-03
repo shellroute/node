@@ -37,7 +37,7 @@ import (
 type entryPhase int
 
 const (
-	phaseConnecting   entryPhase = iota
+	phaseConnecting entryPhase = iota
 	phaseActive
 	phaseReconnecting
 	phaseRetiring
@@ -87,7 +87,7 @@ type cleanupAttempt struct {
 // bulkOp represents a shared authoritative bulk cleanup operation.
 type bulkOp struct {
 	done chan struct{} // closed when the operation completes
-	err  error        // result
+	err  error         // result
 }
 
 type multiConnectionManager struct {

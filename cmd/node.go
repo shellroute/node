@@ -48,23 +48,23 @@ type SleepNotifier interface {
 // NewNode function creates new Mysterium node by given options
 func NewNode(connectionManager connection.MultiManager, tequilapiServer tequilapi.APIServer, publisher Publisher, uiServer UIServer, notifier SleepNotifier) *Node {
 	return &Node{
-		connectionManager:  connectionManager,
-		httpAPIServer:      tequilapiServer,
-		publisher:          publisher,
-		uiServer:           uiServer,
-		sleepNotifier:      notifier,
-		ShutdownTimeout:    5 * time.Second,
+		connectionManager: connectionManager,
+		httpAPIServer:     tequilapiServer,
+		publisher:         publisher,
+		uiServer:          uiServer,
+		sleepNotifier:     notifier,
+		ShutdownTimeout:   5 * time.Second,
 	}
 }
 
 // Node represent entrypoint for Mysterium node with top level components
 type Node struct {
-	connectionManager  connection.MultiManager
-	httpAPIServer      tequilapi.APIServer
-	publisher          Publisher
-	uiServer           UIServer
-	sleepNotifier      SleepNotifier
-	ShutdownTimeout    time.Duration // injectable for tests; default 5s
+	connectionManager connection.MultiManager
+	httpAPIServer     tequilapi.APIServer
+	publisher         Publisher
+	uiServer          UIServer
+	sleepNotifier     SleepNotifier
+	ShutdownTimeout   time.Duration // injectable for tests; default 5s
 }
 
 // Start starts Mysterium node (Tequilapi service, fetches location)

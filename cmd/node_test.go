@@ -37,7 +37,7 @@ func (m *blockingMultiManager) Disconnect(ctx context.Context, id int) error {
 	}
 	return nil
 }
-func (m *blockingMultiManager) CheckChannel(context.Context) error { return nil }
+func (m *blockingMultiManager) CheckChannel(context.Context) error   { return nil }
 func (m *blockingMultiManager) Reconnect(context.Context, int) error { return nil }
 
 type recordingAPIServer struct {

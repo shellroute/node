@@ -104,9 +104,9 @@ func newTestMulti() (*multiConnectionManager, *managersSlice) {
 	return mcm, created
 }
 
-func bg() context.Context                { return context.Background() }
-func dummyID() identity.Identity         { return identity.Identity{Address: "0x1"} }
-func dummyHermes() common.Address        { return common.HexToAddress("0x2") }
+func bg() context.Context         { return context.Background() }
+func dummyID() identity.Identity  { return identity.Identity{Address: "0x1"} }
+func dummyHermes() common.Address { return common.HexToAddress("0x2") }
 func dummyLookup() ProposalLookup {
 	return func() (*proposal.PricedServiceProposal, error) { return nil, nil }
 }
