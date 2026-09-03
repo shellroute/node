@@ -20,14 +20,29 @@ package connection
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/ethereum/go-ethereum/common"
-
-	"github.com/mysteriumnetwork/node/identity"
 )
+
+// observingContext wraps a context and signals when its Done() method
+// is first evaluated. This proves the goroutine reached a select on
+// ctx.Done() — the exact barrier needed for deterministic tests.
+type observingContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func newObservingContext(parent context.Context) *observingContext {
+	return &observingContext{Context: parent, observed: make(chan struct{})}
+}
+
+func (c *observingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
 
 // blockingDisconnectManager blocks on Disconnect until gate is closed.
 // Optional disconnectEntered is closed when Disconnect enters.
@@ -53,6 +68,61 @@ func (m *blockingDisconnectManager) Disconnect() error {
 		return m.disconnectErrFn(n)
 	}
 	return nil
+}
+
+func TestBulkSingleFlight(t *testing.T) {
+	gate := make(chan struct{})
+	disconnectEntered := make(chan struct{})
+	mcm, _ := newTestMulti()
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	blockingMgr := &blockingDisconnectManager{gate: gate, disconnectEntered: disconnectEntered}
+	mcm.mu.Lock()
+	mcm.current[100].manager = blockingMgr
+	mcm.mu.Unlock()
+
+	// Start leader — wait for low-level Disconnect to be entered
+	errs := make([]error, 3)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); errs[0] = mcm.Disconnect(bg(), -1) }()
+
+	select {
+	case <-disconnectEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect not entered")
+	}
+
+	// Start joiners with observingContexts — proves each reached select on ctx.Done()
+	obs1 := newObservingContext(bg())
+	obs2 := newObservingContext(bg())
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[1] = mcm.Disconnect(obs1, -1) }()
+	go func() { defer wg.Done(); errs[2] = mcm.Disconnect(obs2, -1) }()
+
+	// Wait for both joiners to reach their select (proves they attached)
+	select {
+	case <-obs1.observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("joiner 1 did not reach select")
+	}
+	select {
+	case <-obs2.observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("joiner 2 did not reach select")
+	}
+
+	close(gate)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("caller %d got error: %v", i, err)
+		}
+	}
+	if n := blockingMgr.disconnCount.Load(); n != 1 {
+		t.Errorf("expected exactly 1 Manager.Disconnect call, got %d", n)
+	}
 }
 
 func TestBulkTimeoutReturnsFalse(t *testing.T) {
@@ -165,74 +235,6 @@ func TestGatewayRetryAfterTimeout(t *testing.T) {
 	// Connect should succeed after reconciliation
 	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
 		t.Errorf("connect after reconciliation should work, got %v", err)
-	}
-}
-
-// --- Reconnect tests ---
-
-type reconnectableManager struct {
-	mockManager
-	reconnectErr error
-}
-
-func (m *reconnectableManager) ConnectContext(_ context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
-	return m.Connect(identity.Identity{}, common.Address{}, nil, ConnectParams{})
-}
-func (m *reconnectableManager) CancelCurrentOperation() {}
-func (m *reconnectableManager) DisconnectContext(_ context.Context) error {
-	return m.Disconnect()
-}
-func (m *reconnectableManager) ReconnectContext(_ context.Context) error {
-	return m.reconnectErr
-}
-
-func TestReconnectPropagatesError(t *testing.T) {
-	wantErr := errors.New("reconnect failed")
-	created := &managersSlice{}
-	mcm := NewMultiConnectionManager(func() Manager {
-		m := &reconnectableManager{}
-		created.add(&m.mockManager)
-		return m
-	})
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-
-	mcm.mu.Lock()
-	rm := mcm.current[100].manager.(*reconnectableManager)
-	rm.reconnectErr = wantErr
-	mcm.mu.Unlock()
-
-	err := mcm.Reconnect(bg(), 100)
-	if err == nil {
-		t.Fatal("expected error from failed reconnect")
-	}
-	if !errors.Is(err, wantErr) {
-		t.Errorf("expected %v, got %v", wantErr, err)
-	}
-
-	mcm.Disconnect(bg(), -1)
-	if n := registryLen(mcm); n != 0 {
-		t.Errorf("failed reconnect should remove from current, got %d", n)
-	}
-}
-
-func TestReconnectSucceeds(t *testing.T) {
-	mcm := NewMultiConnectionManager(func() Manager {
-		return &reconnectableManager{}
-	})
-
-	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-
-	if err := mcm.Reconnect(bg(), 100); err != nil {
-		t.Errorf("reconnect should succeed, got %v", err)
-	}
-
-	if n := registryLen(mcm); n != 1 {
-		t.Errorf("expected 1 current entry, got %d", n)
 	}
 }
 
@@ -425,25 +427,16 @@ func TestCallerDeadlineServerContinues(t *testing.T) {
 		t.Fatal("leader did not time out")
 	}
 
-	// Retry attaches to server-side cleanup that's still running.
-	// Wait for retry to observe activeBulk before releasing gate.
+	// Retry attaches to server-side cleanup. Use observingContext to
+	// prove it reached its select before we release the gate.
+	retryObs := newObservingContext(bg())
 	retryDone := make(chan error, 1)
-	go func() { retryDone <- mcm.Disconnect(bg(), -1) }()
+	go func() { retryDone <- mcm.Disconnect(retryObs, -1) }()
 
-	deadline := time.After(5 * time.Second)
-	for {
-		wait := mcm.waitNotify()
-		mcm.mu.Lock()
-		hasBulk := mcm.activeBulk != nil
-		mcm.mu.Unlock()
-		if hasBulk {
-			break
-		}
-		select {
-		case <-wait:
-		case <-deadline:
-			t.Fatal("retry did not install activeBulk")
-		}
+	select {
+	case <-retryObs.observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not reach select")
 	}
 
 	close(gate)

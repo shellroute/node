@@ -354,60 +354,6 @@ func TestBlockedConnectVsBulkDisconnect(t *testing.T) {
 	}
 }
 
-func TestBulkSingleFlight(t *testing.T) {
-	gate := make(chan struct{})
-	disconnectEntered := make(chan struct{})
-	mcm, _ := newTestMulti()
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-
-	blockingMgr := &blockingDisconnectManager{gate: gate, disconnectEntered: disconnectEntered}
-	mcm.mu.Lock()
-	mcm.current[100].manager = blockingMgr
-	mcm.mu.Unlock()
-
-	// Start leader — wait for low-level Disconnect to be entered
-	errs := make([]error, 3)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); errs[0] = mcm.Disconnect(bg(), -1) }()
-
-	select {
-	case <-disconnectEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Disconnect not entered")
-	}
-
-	// Start two joiners. Since activeBulk is already installed (leader is
-	// blocking in Disconnect), joiners take the fast attach path: lock mu,
-	// see activeBulk != nil, unlock, and select on bulk.done. The Disconnect
-	// call to the underlying manager is blocked on gate, so bulk.done cannot
-	// close until we release. Any joiner that reaches select before release
-	// will correctly wait.
-	wg.Add(2)
-	go func() { defer wg.Done(); errs[1] = mcm.Disconnect(bg(), -1) }()
-	go func() { defer wg.Done(); errs[2] = mcm.Disconnect(bg(), -1) }()
-
-	// Verify activeBulk is installed (proves joiners have a bulk to attach to)
-	mcm.mu.Lock()
-	if mcm.activeBulk == nil {
-		mcm.mu.Unlock()
-		t.Fatal("activeBulk should exist while leader is blocked")
-	}
-	mcm.mu.Unlock()
-
-	close(gate)
-	wg.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("caller %d got error: %v", i, err)
-		}
-	}
-	if n := blockingMgr.disconnCount.Load(); n != 1 {
-		t.Errorf("expected exactly 1 Manager.Disconnect call, got %d", n)
-	}
-}
-
 func TestTwoUnrelatedPortsConcurrent(t *testing.T) {
 	gate := make(chan struct{})
 	entered1 := make(chan struct{})
