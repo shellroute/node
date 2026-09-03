@@ -182,7 +182,8 @@ type connectionManager struct {
 	connectOptions ConnectOptions
 
 	activeConnection Connection
-	statsTracker     statsTracker
+	statsLock        sync.Mutex
+	statsTracker     *statsTracker
 
 	uuid string
 }
@@ -367,12 +368,20 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 
-	m.statsTracker = newStatsTracker(m.eventBus, m.statsReportInterval)
-	go m.statsTracker.start(m, m.activeConnection)
+	st := newStatsTracker(m.eventBus, m.statsReportInterval)
+	m.statsLock.Lock()
+	m.statsTracker = &st
+	m.statsLock.Unlock()
+	go st.start(m, m.activeConnection)
 	m.addCleanup(func() error {
 		log.Trace().Msg("Cleaning: stopping statistics publisher")
 		defer log.Trace().Msg("Cleaning: stopping statistics publisher DONE")
-		m.statsTracker.stop()
+		st.stop()
+		m.statsLock.Lock()
+		if m.statsTracker == &st {
+			m.statsTracker = nil
+		}
+		m.statsLock.Unlock()
 		return nil
 	})
 
@@ -818,7 +827,13 @@ func (m *connectionManager) UUID() string {
 }
 
 func (m *connectionManager) Stats() connectionstate.Statistics {
-	return m.statsTracker.stats()
+	m.statsLock.Lock()
+	st := m.statsTracker
+	m.statsLock.Unlock()
+	if st == nil {
+		return connectionstate.Statistics{}
+	}
+	return st.stats()
 }
 
 func (m *connectionManager) setStatus(delta func(status *connectionstate.Status)) {
