@@ -81,7 +81,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		mcm.mu.Lock()
 		gen := mcm.generation
 		mcm.mu.Unlock()
-		log.Debug().Int("port", params.ProxyPort).Str("op", "connect").
+		log.Debug().Int("port", params.ProxyPort).Str("operation", "connect").
 			Uint64("generation", gen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Connect finished")
 	}()
@@ -265,7 +265,7 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) (retE
 		mcm.mu.Lock()
 		gen := mcm.generation
 		mcm.mu.Unlock()
-		log.Debug().Int("port", id).Str("op", "disconnect").
+		log.Debug().Int("port", id).Str("operation", "disconnect").
 			Uint64("generation", gen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Disconnect finished")
 	}()
@@ -308,7 +308,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retEr
 		mcm.mu.Lock()
 		gen := mcm.generation
 		mcm.mu.Unlock()
-		log.Debug().Int("port", id).Str("op", "reconnect").
+		log.Debug().Int("port", id).Str("operation", "reconnect").
 			Uint64("generation", gen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Reconnect finished")
 	}()

@@ -25,6 +25,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -100,6 +101,69 @@ func (e *portEntry) retire() {
 	}
 	e.priorPhase = e.phase
 	e.phase = phaseRetiring
+}
+
+// lifecycleSnapshot captures sorted port lists for diagnostics. Must be
+// built under mu so all fields are consistent.
+type lifecycleSnapshot struct {
+	Current         []int
+	Connecting      []int
+	Reconnecting    []int
+	Retiring        []int
+	CleanupRunning  []int
+	WasConnecting   []int
+	WasReconnecting []int
+	WasActive       []int
+}
+
+// snapshot builds a consistent lifecycleSnapshot under mu.
+func (mcm *multiConnectionManager) snapshot() lifecycleSnapshot {
+	var s lifecycleSnapshot
+	for port, e := range mcm.current {
+		s.Current = append(s.Current, port)
+		switch e.phase {
+		case phaseConnecting:
+			s.Connecting = append(s.Connecting, port)
+		case phaseReconnecting:
+			s.Reconnecting = append(s.Reconnecting, port)
+		}
+	}
+	for port, e := range mcm.retiring {
+		s.Retiring = append(s.Retiring, port)
+		if e.cleanupRunning {
+			s.CleanupRunning = append(s.CleanupRunning, port)
+		}
+		switch e.priorPhase {
+		case phaseConnecting:
+			s.WasConnecting = append(s.WasConnecting, port)
+		case phaseReconnecting:
+			s.WasReconnecting = append(s.WasReconnecting, port)
+		case phaseActive:
+			s.WasActive = append(s.WasActive, port)
+		}
+	}
+	sort.Ints(s.Current)
+	sort.Ints(s.Connecting)
+	sort.Ints(s.Reconnecting)
+	sort.Ints(s.Retiring)
+	sort.Ints(s.CleanupRunning)
+	sort.Ints(s.WasConnecting)
+	sort.Ints(s.WasReconnecting)
+	sort.Ints(s.WasActive)
+	return s
+}
+
+// logSnapshot emits the snapshot fields on a zerolog event.
+func (s lifecycleSnapshot) logSnapshot(e *zerolog.Event) *zerolog.Event {
+	return e.
+		Ints("current_ports", s.Current).
+		Ints("connecting", s.Connecting).
+		Ints("reconnecting", s.Reconnecting).
+		Ints("retiring", s.Retiring).
+		Ints("cleanup_running", s.CleanupRunning).
+		Ints("was_connecting", s.WasConnecting).
+		Ints("was_reconnecting", s.WasReconnecting).
+		Ints("was_active", s.WasActive)
 }
 
 // stateChanged closes the current notify channel and replaces it.
@@ -246,8 +310,12 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 		case <-bulk.done:
 			return bulk.err
 		case <-ctx.Done():
-			log.Warn().Uint64("generation", gen).
-				Msg("Caller timed out while attached to shared bulk cleanup")
+			mcm.mu.Lock()
+			snap := mcm.snapshot()
+			mcm.mu.Unlock()
+			snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
+				Uint64("generation", gen).Bool("caller_timed_out", true).
+				Err(ctx.Err())).Msg("Caller timed out while attached to shared bulk cleanup")
 			return ctx.Err()
 		}
 	}
@@ -270,14 +338,18 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	// Clear prior failed attempts so retireEntry can create a new one
 	for _, e := range mcm.retiring {
 		if e.cleanupAttempt != nil && e.cleanupAttempt.err != nil && !e.cleanupRunning {
-			e.cleanupAttempt = nil // old attempt stays immutable; new one created on retry
+			e.cleanupAttempt = nil
 		}
 	}
 
+	snap := mcm.snapshot()
 	bulk := &bulkOp{done: make(chan struct{})}
 	mcm.activeBulk = bulk
 	mcm.stateChanged()
 	mcm.mu.Unlock()
+
+	snap.logSnapshot(log.Info().Str("operation", "disconnect_all").
+		Uint64("generation", gen)).Msg("Bulk disconnect started")
 
 	// Launch server-owned bulk worker
 	go mcm.bulkWorker(bulk, gen)
@@ -287,8 +359,12 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	case <-bulk.done:
 		return bulk.err
 	case <-ctx.Done():
-		log.Warn().Uint64("generation", gen).
-			Msg("Caller timed out while shared bulk cleanup continues server-side")
+		mcm.mu.Lock()
+		snap := mcm.snapshot()
+		mcm.mu.Unlock()
+		snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
+			Uint64("generation", gen).Bool("caller_timed_out", true).
+			Err(ctx.Err())).Msg("Caller timed out while shared bulk cleanup continues server-side")
 		return ctx.Err()
 	}
 }
@@ -298,7 +374,6 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 // for all retiring entries to resolve. Never exits until done or timed out.
 func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 	bulkStart := time.Now()
-	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
 
 	// Collect managers and opCancels under lock, cancel outside
 	mcm.mu.Lock()
@@ -313,7 +388,6 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			e.opCancel = nil
 		}
 	}
-	// Start missing cleanup attempts
 	for _, e := range mcm.retiring {
 		if !e.cleanupRunning && e.cleanupAttempt == nil {
 			go mcm.retireEntry(e)
@@ -334,39 +408,33 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			mcm.reconcileRequired = false
 			mcm.activeBulk = nil
 			bulk.err = nil
+			snap := mcm.snapshot()
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			log.Info().Uint64("generation", gen).Dur("elapsed", time.Since(bulkStart)).
+			snap.logSnapshot(log.Info().Str("operation", "disconnect_all").
+				Uint64("generation", gen).Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect completed successfully")
 			return
 		}
 
-		// Check for cleanup errors — fail the bulk attempt immediately,
-		// retain reconcileRequired so next request retries
-		var pendingPorts []int
 		var cleanupErrs []error
 		for port, e := range mcm.retiring {
 			if e.cleanupAttempt != nil && e.cleanupAttempt.err != nil {
 				cleanupErrs = append(cleanupErrs, fmt.Errorf("port %d: %w", port, e.cleanupAttempt.err))
 			}
-			if e.cleanupRunning || e.cleanupAttempt == nil || (e.cleanupAttempt != nil && e.cleanupAttempt.err != nil) {
-				pendingPorts = append(pendingPorts, port)
-			}
 		}
 		if len(cleanupErrs) > 0 {
-			// End this bulk attempt — keep reconcileRequired, don't advance generation
 			err := fmt.Errorf("%w: bulk cleanup failed: %w", ErrLifecycleBusy, errors.Join(cleanupErrs...))
-			nRetiring := len(mcm.retiring)
+			snap := mcm.snapshot()
 			mcm.activeBulk = nil
 			bulk.err = err
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			sort.Ints(pendingPorts)
-			log.Error().Err(err).Uint64("generation", gen).
-				Dur("elapsed", time.Since(bulkStart)).
-				Int("retiring_count", nRetiring).Ints("pending_ports", pendingPorts).
+			snap.logSnapshot(log.Error().Str("operation", "disconnect_all").
+				Uint64("generation", gen).Err(err).
+				Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect failed with cleanup error")
 			return
 		}
@@ -379,61 +447,30 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			continue
 		case <-deadline:
 			mcm.mu.Lock()
-			// Snapshot state for diagnostics — includes prior phase identity
-			var cleanupRunningPorts, cleanupPendingPorts []int
-			var wasConnecting, wasReconnecting, wasActive []int
-			for port, e := range mcm.retiring {
-				if e.cleanupRunning {
-					cleanupRunningPorts = append(cleanupRunningPorts, port)
-				} else {
-					cleanupPendingPorts = append(cleanupPendingPorts, port)
-				}
-				switch e.priorPhase {
-				case phaseConnecting:
-					wasConnecting = append(wasConnecting, port)
-				case phaseReconnecting:
-					wasReconnecting = append(wasReconnecting, port)
-				case phaseActive:
-					wasActive = append(wasActive, port)
-				}
-			}
-			nCurrent := len(mcm.current)
-			nRetiring := len(mcm.retiring)
-
+			snap := mcm.snapshot()
 			if mcm.dumpedGen != gen {
 				mcm.dumpedGen = gen
 				mcm.mu.Unlock()
-				sort.Ints(pendingPorts)
-				sort.Ints(cleanupRunningPorts)
-				sort.Ints(cleanupPendingPorts)
-				sort.Ints(wasConnecting)
-				sort.Ints(wasReconnecting)
-				sort.Ints(wasActive)
-				log.Warn().Uint64("generation", gen).
-					Ints("pending_ports", pendingPorts).
-					Ints("cleanup_running", cleanupRunningPorts).
-					Ints("cleanup_pending", cleanupPendingPorts).
-					Ints("was_connecting", wasConnecting).
-					Ints("was_reconnecting", wasReconnecting).
-					Ints("was_active", wasActive).
-					Int("current_count", nCurrent).Int("retiring_count", nRetiring).
-					Dur("elapsed", time.Since(bulkStart)).
+				snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
+					Uint64("generation", gen).
+					Dur("elapsed", time.Since(bulkStart))).
 					Msg("Bulk disconnect timeout — dumping goroutines")
 				pprof.Lookup("goroutine").WriteTo(log.Logger, 2)
 			} else {
 				mcm.mu.Unlock()
 			}
 
-			sort.Ints(pendingPorts)
-			err := fmt.Errorf("%w: bulk disconnect timeout after %s, pending ports: %v", ErrLifecycleBusy, mcm.BulkTimeout, pendingPorts)
+			err := fmt.Errorf("%w: bulk disconnect timeout after %s, retiring: %v",
+				ErrLifecycleBusy, mcm.BulkTimeout, snap.Retiring)
 			mcm.mu.Lock()
 			mcm.activeBulk = nil
 			bulk.err = err
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			log.Error().Err(err).Uint64("generation", gen).
-				Dur("elapsed", time.Since(bulkStart)).
+			snap.logSnapshot(log.Error().Str("operation", "disconnect_all").
+				Uint64("generation", gen).Err(err).
+				Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect failed")
 			return
 		}
