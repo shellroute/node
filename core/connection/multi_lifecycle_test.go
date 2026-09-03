@@ -289,7 +289,14 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	go func() {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
+	// Wait for manager creation via channel check instead of busy-spin
+	deadline := time.After(5 * time.Second)
 	for created.len() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("manager was not created")
+		default:
+		}
 	}
 
 	discDone := make(chan error, 1)
@@ -298,9 +305,27 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	}()
 
 	close(gate)
-	<-connectDone
-	<-discDone
 
+	select {
+	case connectErr := <-connectDone:
+		// Connect may succeed or be cancelled by disconnect — both acceptable
+		if connectErr != nil && !errors.Is(connectErr, ErrConnectionCancelled) && !errors.Is(connectErr, ErrLifecycleBusy) {
+			t.Errorf("connect: unexpected error %v", connectErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect did not complete")
+	}
+
+	select {
+	case discErr := <-discDone:
+		if discErr != nil {
+			t.Errorf("disconnect: unexpected error %v", discErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("disconnect did not complete")
+	}
+
+	// Wait for retirement to complete
 	time.Sleep(50 * time.Millisecond)
 	if n := registryLen(mcm); n != 0 {
 		t.Errorf("current should be empty, got %d", n)
@@ -310,9 +335,15 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 func TestExactManagerRemoval(t *testing.T) {
 	mcm, created := newTestMulti()
 
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
-	mcm.Disconnect(bg(), 100)
-	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("first connect: %v", err)
+	}
+	if err := mcm.Disconnect(bg(), 100); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("second connect: %v", err)
+	}
 
 	if created.len() != 2 {
 		t.Fatalf("expected 2 managers, got %d", created.len())
@@ -330,7 +361,9 @@ func TestExactManagerRemoval(t *testing.T) {
 func TestConnectRacingBulkDisconnect(t *testing.T) {
 	mcm, _ := newTestMulti()
 	for i := 0; i < 10; i++ {
-		mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(i))
+		if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(i)); err != nil {
+			t.Fatalf("setup connect port %d: %v", i, err)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -343,17 +376,22 @@ func TestConnectRacingBulkDisconnect(t *testing.T) {
 	}()
 	wg.Wait()
 
+	// Bulk must succeed or be retryable
+	if errs[0] != nil && !errors.Is(errs[0], ErrLifecycleBusy) {
+		t.Errorf("bulk disconnect: unexpected error %v", errs[0])
+	}
+	// Connect may fail with ErrLifecycleBusy or succeed if it ran first
 	if errs[1] != nil && !errors.Is(errs[1], ErrLifecycleBusy) {
 		t.Errorf("concurrent connect: unexpected error %v", errs[1])
 	}
 
-	mcm.mu.Lock()
-	for port, e := range mcm.current {
-		if e.manager == nil {
-			t.Errorf("nil manager for port %d", port)
-		}
+	// Final reconciliation
+	if err := mcm.Disconnect(bg(), -1); err != nil {
+		t.Errorf("final bulk should succeed, got %v", err)
 	}
-	mcm.mu.Unlock()
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty after reconciliation, got %d", n)
+	}
 }
 
 // --- Stress test ---

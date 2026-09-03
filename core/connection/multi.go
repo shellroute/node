@@ -78,11 +78,15 @@ func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnec
 // Connect creates a new connection on the given port.
 // The port is reserved atomically before creating the manager. The worker
 // owns finalization — cleanup waits for the operation to finish first.
-func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
+func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) (retErr error) {
 	start := time.Now()
 	defer func() {
+		mcm.mu.Lock()
+		gen := mcm.generation
+		mcm.mu.Unlock()
 		log.Debug().Int("port", params.ProxyPort).Str("op", "connect").
-			Dur("elapsed", time.Since(start)).Msg("Connect completed")
+			Uint64("generation", gen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Connect finished")
 	}()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -255,14 +259,18 @@ func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 
 // Disconnect closes an established connection. id < 0 triggers authoritative
 // bulk cleanup. Returns nil only after cleanup completes successfully.
-func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) error {
+func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) (retErr error) {
 	if id < 0 {
 		return mcm.disconnectAll(ctx)
 	}
 	start := time.Now()
 	defer func() {
+		mcm.mu.Lock()
+		gen := mcm.generation
+		mcm.mu.Unlock()
 		log.Debug().Int("port", id).Str("op", "disconnect").
-			Dur("elapsed", time.Since(start)).Msg("Disconnect completed")
+			Uint64("generation", gen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Disconnect finished")
 	}()
 
 	mcm.mu.Lock()
@@ -303,11 +311,14 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	// Attach to existing bulk operation if one is active
 	if mcm.activeBulk != nil {
 		bulk := mcm.activeBulk
+		gen := mcm.generation
 		mcm.mu.Unlock()
 		select {
 		case <-bulk.done:
 			return bulk.err
 		case <-ctx.Done():
+			log.Warn().Uint64("generation", gen).
+				Msg("Caller timed out while attached to shared bulk cleanup")
 			return ctx.Err()
 		}
 	}
@@ -417,12 +428,17 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 		if len(cleanupErrs) > 0 {
 			// End this bulk attempt — keep reconcileRequired, don't advance generation
 			err := fmt.Errorf("%w: bulk cleanup failed: %w", ErrLifecycleBusy, errors.Join(cleanupErrs...))
+			nRetiring := len(mcm.retiring)
 			mcm.activeBulk = nil
 			bulk.err = err
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			log.Error().Err(err).Uint64("generation", gen).Msg("Bulk disconnect failed with cleanup error")
+			sort.Ints(pendingPorts)
+			log.Error().Err(err).Uint64("generation", gen).
+				Dur("elapsed", time.Since(bulkStart)).
+				Int("retiring_count", nRetiring).Ints("pending_ports", pendingPorts).
+				Msg("Bulk disconnect failed with cleanup error")
 			return
 		}
 
@@ -483,11 +499,15 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 // Reconnect disconnects and reconnects on the given port.
 // Uses the same worker-owned pattern as Connect: new operationDone,
 // ctx select, cleanup waits for operation completion.
-func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error {
+func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retErr error) {
 	start := time.Now()
 	defer func() {
+		mcm.mu.Lock()
+		gen := mcm.generation
+		mcm.mu.Unlock()
 		log.Debug().Int("port", id).Str("op", "reconnect").
-			Dur("elapsed", time.Since(start)).Msg("Reconnect completed")
+			Uint64("generation", gen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Reconnect finished")
 	}()
 	if ctx.Err() != nil {
 		return ctx.Err()
