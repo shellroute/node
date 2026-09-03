@@ -77,12 +77,10 @@ func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnec
 // owns finalization — cleanup waits for the operation to finish first.
 func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) (retErr error) {
 	start := time.Now()
+	var opGen uint64 // captured at admission
 	defer func() {
-		mcm.mu.Lock()
-		gen := mcm.generation
-		mcm.mu.Unlock()
 		log.Debug().Int("port", params.ProxyPort).Str("operation", "connect").
-			Uint64("generation", gen).Err(retErr).
+			Uint64("generation", opGen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Connect finished")
 	}()
 	if ctx.Err() != nil {
@@ -116,6 +114,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	}
 	mcm.current[params.ProxyPort] = entry
 	gen := mcm.generation
+	opGen = gen
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
@@ -261,16 +260,15 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) (retE
 		return mcm.disconnectAll(ctx)
 	}
 	start := time.Now()
+	var opGen uint64
 	defer func() {
-		mcm.mu.Lock()
-		gen := mcm.generation
-		mcm.mu.Unlock()
 		log.Debug().Int("port", id).Str("operation", "disconnect").
-			Uint64("generation", gen).Err(retErr).
+			Uint64("generation", opGen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Disconnect finished")
 	}()
 
 	mcm.mu.Lock()
+	opGen = mcm.generation
 	e, ok := mcm.current[id]
 	if !ok {
 		// Check if already retiring
@@ -304,12 +302,10 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) (retE
 // ctx select, cleanup waits for operation completion.
 func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retErr error) {
 	start := time.Now()
+	var opGen uint64
 	defer func() {
-		mcm.mu.Lock()
-		gen := mcm.generation
-		mcm.mu.Unlock()
 		log.Debug().Int("port", id).Str("operation", "reconnect").
-			Uint64("generation", gen).Err(retErr).
+			Uint64("generation", opGen).Err(retErr).
 			Dur("elapsed", time.Since(start)).Msg("Reconnect finished")
 	}()
 	if ctx.Err() != nil {
@@ -317,6 +313,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retEr
 	}
 
 	mcm.mu.Lock()
+	opGen = mcm.generation
 	if mcm.reconcileRequired {
 		mcm.mu.Unlock()
 		return ErrLifecycleBusy

@@ -153,14 +153,14 @@ func (mcm *multiConnectionManager) snapshot() lifecycleSnapshot {
 	return s
 }
 
-// logSnapshot emits the snapshot fields on a zerolog event.
+// logSnapshot emits the snapshot fields and counts on a zerolog event.
 func (s lifecycleSnapshot) logSnapshot(e *zerolog.Event) *zerolog.Event {
 	return e.
-		Ints("current_ports", s.Current).
-		Ints("connecting", s.Connecting).
-		Ints("reconnecting", s.Reconnecting).
-		Ints("retiring", s.Retiring).
-		Ints("cleanup_running", s.CleanupRunning).
+		Int("current_count", len(s.Current)).Ints("current_ports", s.Current).
+		Int("connecting_count", len(s.Connecting)).Ints("connecting", s.Connecting).
+		Int("reconnecting_count", len(s.Reconnecting)).Ints("reconnecting", s.Reconnecting).
+		Int("retiring_count", len(s.Retiring)).Ints("retiring", s.Retiring).
+		Int("cleanup_running_count", len(s.CleanupRunning)).Ints("cleanup_running", s.CleanupRunning).
 		Ints("was_connecting", s.WasConnecting).
 		Ints("was_reconnecting", s.WasReconnecting).
 		Ints("was_active", s.WasActive)
@@ -299,6 +299,7 @@ func (mcm *multiConnectionManager) cancelManager(m Manager) {
 // share the same operation. The bulk worker runs in its own server-owned
 // goroutine — HTTP callers only wait on the result channel.
 func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
+	callerStart := time.Now()
 	mcm.mu.Lock()
 
 	// Attach to existing bulk operation if one is active
@@ -315,6 +316,7 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 			mcm.mu.Unlock()
 			snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
 				Uint64("generation", gen).Bool("caller_timed_out", true).
+				Dur("elapsed", time.Since(callerStart)).
 				Err(ctx.Err())).Msg("Caller timed out while attached to shared bulk cleanup")
 			return ctx.Err()
 		}
@@ -349,7 +351,7 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	mcm.mu.Unlock()
 
 	snap.logSnapshot(log.Info().Str("operation", "disconnect_all").
-		Uint64("generation", gen)).Msg("Bulk disconnect started")
+		Uint64("generation", gen).Bool("caller_timed_out", false)).Msg("Bulk disconnect started")
 
 	// Launch server-owned bulk worker
 	go mcm.bulkWorker(bulk, gen)
@@ -364,6 +366,7 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 		mcm.mu.Unlock()
 		snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
 			Uint64("generation", gen).Bool("caller_timed_out", true).
+			Dur("elapsed", time.Since(callerStart)).
 			Err(ctx.Err())).Msg("Caller timed out while shared bulk cleanup continues server-side")
 		return ctx.Err()
 	}
@@ -413,7 +416,8 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			snap.logSnapshot(log.Info().Str("operation", "disconnect_all").
-				Uint64("generation", gen).Dur("elapsed", time.Since(bulkStart))).
+				Uint64("generation", gen).Bool("caller_timed_out", false).
+				Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect completed successfully")
 			return
 		}
@@ -433,7 +437,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			snap.logSnapshot(log.Error().Str("operation", "disconnect_all").
-				Uint64("generation", gen).Err(err).
+				Uint64("generation", gen).Bool("caller_timed_out", false).Err(err).
 				Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect failed with cleanup error")
 			return
@@ -452,7 +456,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 				mcm.dumpedGen = gen
 				mcm.mu.Unlock()
 				snap.logSnapshot(log.Warn().Str("operation", "disconnect_all").
-					Uint64("generation", gen).
+					Uint64("generation", gen).Bool("caller_timed_out", false).
 					Dur("elapsed", time.Since(bulkStart))).
 					Msg("Bulk disconnect timeout — dumping goroutines")
 				pprof.Lookup("goroutine").WriteTo(log.Logger, 2)
@@ -469,7 +473,7 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			mcm.stateChanged()
 			mcm.mu.Unlock()
 			snap.logSnapshot(log.Error().Str("operation", "disconnect_all").
-				Uint64("generation", gen).Err(err).
+				Uint64("generation", gen).Bool("caller_timed_out", false).Err(err).
 				Dur("elapsed", time.Since(bulkStart))).
 				Msg("Bulk disconnect failed")
 			return
