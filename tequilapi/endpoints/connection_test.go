@@ -536,4 +536,54 @@ func TestConnectReturnsErrorIfNoProposals(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, resp.Code)
 }
 
+func TestCreateReturns503OnLifecycleBusy(t *testing.T) {
+	manager := mockConnectionManager{onConnectReturn: connection.ErrLifecycleBusy}
+	proposalProvider := mockRepositoryWithProposal("required-node", "wireguard")
+	req := httptest.NewRequest(http.MethodPut, "/connection", strings.NewReader(`{
+		"consumer_id": "0x1",
+		"provider_id": "required-node",
+		"hermes_id": "hermes",
+		"service_type": "wireguard"
+	}`))
+	resp := httptest.NewRecorder()
+	g := summonTestGin()
+	err := AddRoutesForConnection(&manager, &mockStateProvider{}, proposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+	assert.NoError(t, err)
+	g.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+}
+
+func TestDeleteReturns503OnLifecycleBusy(t *testing.T) {
+	manager := mockConnectionManager{onDisconnectReturn: connection.ErrLifecycleBusy}
+	req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
+	resp := httptest.NewRecorder()
+	g := summonTestGin()
+	err := AddRoutesForConnection(&manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+	assert.NoError(t, err)
+	g.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+}
+
+func TestDeleteReturns503OnContextCanceled(t *testing.T) {
+	manager := mockConnectionManager{onDisconnectReturn: context.Canceled}
+	req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
+	resp := httptest.NewRecorder()
+	g := summonTestGin()
+	err := AddRoutesForConnection(&manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+	assert.NoError(t, err)
+	g.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+}
+
+func TestDeleteReturns202OnSuccess(t *testing.T) {
+	manager := mockConnectionManager{onDisconnectReturn: nil}
+	req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
+	resp := httptest.NewRecorder()
+	g := summonTestGin()
+	err := AddRoutesForConnection(&manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+	assert.NoError(t, err)
+	g.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusAccepted, resp.Code)
+}
+
 var mockIdentityRegistryInstance = &registry.FakeRegistry{RegistrationStatus: registry.Registered}

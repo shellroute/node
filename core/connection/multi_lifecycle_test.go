@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -242,5 +243,181 @@ func TestStatsSafeDuringConnect(t *testing.T) {
 	}
 	if n := mgr.statsCalls.Load(); n != 1 {
 		t.Errorf("Stats should have been called once after active, got %d", n)
+	}
+}
+
+// --- Restored pre-plan tests (adapted for context-aware API) ---
+
+func TestConcurrentSamePortConnect(t *testing.T) {
+	mcm, _ := newTestMulti()
+
+	var wg sync.WaitGroup
+	var errs [2]error
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Errorf("expected 1 success, got %d", successes)
+	}
+	if n := registryLen(mcm); n != 1 {
+		t.Errorf("expected 1 entry, got %d", n)
+	}
+}
+
+func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
+	gate := make(chan struct{})
+	created := &managersSlice{}
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &mockManager{connectGate: gate}
+		created.add(m)
+		return m
+	})
+
+	connectDone := make(chan error, 1)
+	go func() {
+		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
+	}()
+	for created.len() == 0 {
+	}
+
+	discDone := make(chan error, 1)
+	go func() {
+		discDone <- mcm.Disconnect(bg(), 200)
+	}()
+
+	close(gate)
+	<-connectDone
+	<-discDone
+
+	time.Sleep(50 * time.Millisecond)
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty, got %d", n)
+	}
+}
+
+func TestExactManagerRemoval(t *testing.T) {
+	mcm, created := newTestMulti()
+
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	mcm.Disconnect(bg(), 100)
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	if created.len() != 2 {
+		t.Fatalf("expected 2 managers, got %d", created.len())
+	}
+
+	mcm.mu.Lock()
+	e := mcm.current[100]
+	mcm.mu.Unlock()
+
+	if e == nil || e.manager != created.get(1) {
+		t.Error("current manager should be the second one created")
+	}
+}
+
+func TestConnectRacingBulkDisconnect(t *testing.T) {
+	mcm, _ := newTestMulti()
+	for i := 0; i < 10; i++ {
+		mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(i))
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = mcm.Disconnect(bg(), -1) }()
+	go func() {
+		defer wg.Done()
+		errs[1] = mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(999))
+	}()
+	wg.Wait()
+
+	if errs[1] != nil && !errors.Is(errs[1], ErrLifecycleBusy) {
+		t.Errorf("concurrent connect: unexpected error %v", errs[1])
+	}
+
+	mcm.mu.Lock()
+	for port, e := range mcm.current {
+		if e.manager == nil {
+			t.Errorf("nil manager for port %d", port)
+		}
+	}
+	mcm.mu.Unlock()
+}
+
+// --- Stress test ---
+
+func TestRaceStressConnectDisconnect(t *testing.T) {
+	mcm, _ := newTestMulti()
+
+	var mu sync.Mutex
+	var allErrs []error
+	collectErr := func(err error) {
+		if err == nil {
+			return
+		}
+		mu.Lock()
+		allErrs = append(allErrs, err)
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				collectErr(mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(port)))
+				collectErr(mcm.Disconnect(bg(), port))
+			}
+		}(g * 100)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			collectErr(mcm.Disconnect(bg(), -1))
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stress test did not complete within 10s")
+	}
+
+	for _, err := range allErrs {
+		if !errors.Is(err, ErrLifecycleBusy) && !errors.Is(err, ErrAlreadyExists) &&
+			!errors.Is(err, ErrConnectionCancelled) && !errors.Is(err, ErrNoConnection) {
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+
+	if err := mcm.Disconnect(bg(), -1); err != nil {
+		t.Errorf("final bulk should succeed, got %v", err)
+	}
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty after stress, got %d", n)
+	}
+	if n := retiringLen(mcm); n != 0 {
+		t.Errorf("retiring should be empty after stress, got %d", n)
 	}
 }

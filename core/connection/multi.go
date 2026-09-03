@@ -33,68 +33,6 @@ import (
 	"github.com/mysteriumnetwork/node/identity"
 )
 
-// entryPhase tracks the lifecycle state of a managed connection.
-type entryPhase int
-
-const (
-	phaseConnecting entryPhase = iota
-	phaseActive
-	phaseReconnecting
-	phaseRetiring
-)
-
-func (p entryPhase) String() string {
-	switch p {
-	case phaseConnecting:
-		return "connecting"
-	case phaseActive:
-		return "active"
-	case phaseReconnecting:
-		return "reconnecting"
-	case phaseRetiring:
-		return "retiring"
-	default:
-		return "unknown"
-	}
-}
-
-// portEntry tracks one managed connection's lifecycle.
-// All fields are protected by the coordinator's mu.
-type portEntry struct {
-	port       int
-	generation uint64
-	manager    Manager
-	phase      entryPhase
-
-	// operationDone is closed when the Connect/Reconnect worker finishes.
-	// Cleanup must wait for this before starting Disconnect.
-	operationDone chan struct{}
-
-	// opCancel cancels the coordinator-owned operation context passed to
-	// the lifecycleManager. Extracted under mu, invoked outside mu by
-	// individual/bulk retirement. Nil after worker finalizes.
-	opCancel context.CancelFunc
-
-	// cleanupRunning is true while a Disconnect call is in-flight on the manager.
-	cleanupRunning bool
-	// cleanupAttempt points to the current cleanup attempt. Nil until cleanup starts.
-	// Each attempt is immutable once done is closed — retries create a new attempt.
-	cleanupAttempt *cleanupAttempt
-}
-
-// cleanupAttempt is an immutable result container for one cleanup try.
-// Once done is closed, err is final and never mutated.
-type cleanupAttempt struct {
-	done chan struct{}
-	err  error
-}
-
-// bulkOp represents a shared authoritative bulk cleanup operation.
-type bulkOp struct {
-	done chan struct{} // closed when the operation completes
-	err  error         // result
-}
-
 type multiConnectionManager struct {
 	// mu protects all mutable state. Never held during Manager network calls.
 	mu sync.Mutex
@@ -137,25 +75,15 @@ func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnec
 	}
 }
 
-// stateChanged closes the current notify channel and replaces it.
-// Must be called under mu.
-func (mcm *multiConnectionManager) stateChanged() {
-	close(mcm.notify)
-	mcm.notify = make(chan struct{})
-}
-
-// waitNotify returns a channel that will be closed on the next state change.
-func (mcm *multiConnectionManager) waitNotify() <-chan struct{} {
-	mcm.mu.Lock()
-	ch := mcm.notify
-	mcm.mu.Unlock()
-	return ch
-}
-
 // Connect creates a new connection on the given port.
 // The port is reserved atomically before creating the manager. The worker
 // owns finalization — cleanup waits for the operation to finish first.
 func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
+	start := time.Now()
+	defer func() {
+		log.Debug().Int("port", params.ProxyPort).Str("op", "connect").
+			Dur("elapsed", time.Since(start)).Msg("Connect completed")
+	}()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -331,6 +259,11 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) error
 	if id < 0 {
 		return mcm.disconnectAll(ctx)
 	}
+	start := time.Now()
+	defer func() {
+		log.Debug().Int("port", id).Str("op", "disconnect").
+			Dur("elapsed", time.Since(start)).Msg("Disconnect completed")
+	}()
 
 	mcm.mu.Lock()
 	e, ok := mcm.current[id]
@@ -359,101 +292,6 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) error
 	mcm.cancelManager(e.manager)
 
 	return mcm.waitRetirement(ctx, e)
-}
-
-// waitRetirement waits for an entry's cleanup to complete or ctx to expire.
-func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *portEntry) error {
-	mcm.mu.Lock()
-	if entry.cleanupAttempt == nil {
-		go mcm.retireEntry(entry)
-	}
-	att := entry.cleanupAttempt
-	mcm.mu.Unlock()
-
-	// Wait for attempt to exist if it didn't yet
-	if att == nil {
-		for {
-			wait := mcm.waitNotify()
-			mcm.mu.Lock()
-			att = entry.cleanupAttempt
-			mcm.mu.Unlock()
-			if att != nil {
-				break
-			}
-			select {
-			case <-wait:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	// Wait on the captured attempt — immutable once done is closed
-	select {
-	case <-att.done:
-		return att.err // immutable: never overwritten by retry
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// retireEntry runs cleanup on an entry's manager. Waits for any in-flight
-// operation (Connect/Reconnect) to finish first. Only one cleanup per entry.
-func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
-	// Claim cleanup ownership under lock first — prevents double cleanup
-	mcm.mu.Lock()
-	if entry.cleanupRunning || entry.cleanupAttempt != nil {
-		mcm.mu.Unlock()
-		return // already started or completed
-	}
-	entry.cleanupRunning = true
-	attempt := &cleanupAttempt{done: make(chan struct{})}
-	entry.cleanupAttempt = attempt
-	mcm.stateChanged()
-	mcm.mu.Unlock()
-
-	// Wait for the operation (Connect/factory) to finish before disconnecting
-	if entry.operationDone != nil {
-		<-entry.operationDone
-	}
-
-	// After operation finished, check if manager was ever created
-	mcm.mu.Lock()
-	m := entry.manager
-	mcm.mu.Unlock()
-	if m == nil {
-		// Factory never completed or entry was a bare reservation — nothing to disconnect
-		mcm.mu.Lock()
-		delete(mcm.retiring, entry.port)
-		entry.cleanupRunning = false
-		close(attempt.done)
-		mcm.stateChanged()
-		mcm.mu.Unlock()
-		return
-	}
-
-	// Use DisconnectContext with hard deadline to prevent unbounded hangs
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), mcm.BulkTimeout)
-	defer cleanupCancel()
-	var err error
-	if lm, ok := m.(lifecycleManager); ok {
-		err = lm.DisconnectContext(cleanupCtx)
-	} else {
-		err = m.Disconnect()
-	}
-
-	mcm.mu.Lock()
-	if err == nil || errors.Is(err, ErrNoConnection) {
-		attempt.err = nil
-		delete(mcm.retiring, entry.port)
-	} else {
-		attempt.err = err
-		log.Error().Err(err).Int("port", entry.port).Msg("Connection cleanup failed")
-	}
-	entry.cleanupRunning = false
-	close(attempt.done)
-	mcm.stateChanged()
-	mcm.mu.Unlock()
 }
 
 // disconnectAll performs authoritative bulk cleanup. Concurrent callers
@@ -509,6 +347,8 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 	case <-bulk.done:
 		return bulk.err
 	case <-ctx.Done():
+		log.Warn().Uint64("generation", gen).
+			Msg("Caller timed out while shared bulk cleanup continues server-side")
 		return ctx.Err()
 	}
 }
@@ -517,6 +357,7 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 // completion. It cancels in-flight ops, starts missing cleanups, and waits
 // for all retiring entries to resolve. Never exits until done or timed out.
 func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
+	bulkStart := time.Now()
 	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
 
 	// Collect managers and opCancels under lock, cancel outside
@@ -556,7 +397,8 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			log.Info().Uint64("generation", gen).Msg("Bulk disconnect completed successfully")
+			log.Info().Uint64("generation", gen).Dur("elapsed", time.Since(bulkStart)).
+				Msg("Bulk disconnect completed successfully")
 			return
 		}
 
@@ -592,11 +434,30 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			continue
 		case <-deadline:
 			mcm.mu.Lock()
+			// Snapshot state for diagnostics
+			var cleanupRunningPorts, cleanupPendingPorts []int
+			for port, e := range mcm.retiring {
+				if e.cleanupRunning {
+					cleanupRunningPorts = append(cleanupRunningPorts, port)
+				} else {
+					cleanupPendingPorts = append(cleanupPendingPorts, port)
+				}
+			}
+			nCurrent := len(mcm.current)
+			nRetiring := len(mcm.retiring)
+
 			if mcm.dumpedGen != gen {
 				mcm.dumpedGen = gen
 				mcm.mu.Unlock()
 				sort.Ints(pendingPorts)
-				log.Warn().Uint64("generation", gen).Ints("pending_ports", pendingPorts).
+				sort.Ints(cleanupRunningPorts)
+				sort.Ints(cleanupPendingPorts)
+				log.Warn().Uint64("generation", gen).
+					Ints("pending_ports", pendingPorts).
+					Ints("cleanup_running", cleanupRunningPorts).
+					Ints("cleanup_pending", cleanupPendingPorts).
+					Int("current_count", nCurrent).Int("retiring_count", nRetiring).
+					Dur("elapsed", time.Since(bulkStart)).
 					Msg("Bulk disconnect timeout — dumping goroutines")
 				pprof.Lookup("goroutine").WriteTo(log.Logger, 2)
 			} else {
@@ -611,7 +472,9 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 			close(bulk.done)
 			mcm.stateChanged()
 			mcm.mu.Unlock()
-			log.Error().Err(err).Uint64("generation", gen).Msg("Bulk disconnect failed")
+			log.Error().Err(err).Uint64("generation", gen).
+				Dur("elapsed", time.Since(bulkStart)).
+				Msg("Bulk disconnect failed")
 			return
 		}
 	}
@@ -621,6 +484,11 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 // Uses the same worker-owned pattern as Connect: new operationDone,
 // ctx select, cleanup waits for operation completion.
 func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error {
+	start := time.Now()
+	defer func() {
+		log.Debug().Int("port", id).Str("op", "reconnect").
+			Dur("elapsed", time.Since(start)).Msg("Reconnect completed")
+	}()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -724,16 +592,3 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 
 // CheckChannel checks if current session channel is alive.
 func (mcm *multiConnectionManager) CheckChannel(ctx context.Context) error { return nil }
-
-// cancelManager requests non-blocking cancellation on a manager.
-func (mcm *multiConnectionManager) cancelManager(m Manager) {
-	if m == nil {
-		return
-	}
-	type canceller interface {
-		CancelCurrentOperation()
-	}
-	if c, ok := m.(canceller); ok {
-		c.CancelCurrentOperation()
-	}
-}
