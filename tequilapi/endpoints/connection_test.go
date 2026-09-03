@@ -567,19 +567,21 @@ func TestCreateMaps503(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			manager := &ctxCapturingManager{mockConnectionManager: mockConnectionManager{onConnectReturn: tt.err}}
 			proposalProvider := mockRepositoryWithProposal("required-node", "wireguard")
+			type ctxKey struct{}
 			req := httptest.NewRequest(http.MethodPut, "/connection", strings.NewReader(`{
 				"consumer_id": "0x1",
 				"provider_id": "required-node",
 				"hermes_id": "hermes",
 				"service_type": "wireguard"
 			}`))
+			req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, "marker"))
 			resp := httptest.NewRecorder()
 			g := summonTestGin()
 			err := AddRoutesForConnection(manager, &mockStateProvider{}, proposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 			assert.NoError(t, err)
 			g.ServeHTTP(resp, req)
 			assert.Equal(t, tt.wantStatus, resp.Code)
-			assert.NotNil(t, manager.lastConnectCtx, "request context must be forwarded")
+			assert.Equal(t, "marker", manager.lastConnectCtx.Value(ctxKey{}), "request context must propagate")
 		})
 	}
 }
@@ -597,15 +599,17 @@ func TestDeleteMaps503AndSuccess(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			type ctxKey struct{}
 			manager := &ctxCapturingManager{mockConnectionManager: mockConnectionManager{onDisconnectReturn: tt.err}}
 			req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
+			req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, "marker"))
 			resp := httptest.NewRecorder()
 			g := summonTestGin()
 			err := AddRoutesForConnection(manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
 			assert.NoError(t, err)
 			g.ServeHTTP(resp, req)
 			assert.Equal(t, tt.wantStatus, resp.Code)
-			assert.NotNil(t, manager.lastDisconnectCtx, "request context must be forwarded")
+			assert.Equal(t, "marker", manager.lastDisconnectCtx.Value(ctxKey{}), "request context must propagate")
 		})
 	}
 }

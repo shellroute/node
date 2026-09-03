@@ -92,8 +92,12 @@ type bulkOp struct {
 }
 
 // retire transitions an entry to phaseRetiring, preserving the prior phase
-// for diagnostics. Must be called under mu.
+// for diagnostics. Idempotent — does not overwrite priorPhase if already
+// retiring. Must be called under mu.
 func (e *portEntry) retire() {
+	if e.phase == phaseRetiring {
+		return
+	}
 	e.priorPhase = e.phase
 	e.phase = phaseRetiring
 }
@@ -114,8 +118,14 @@ func (mcm *multiConnectionManager) waitNotify() <-chan struct{} {
 }
 
 // waitRetirement waits for an entry's cleanup to complete or ctx to expire.
+// If a prior attempt failed and no bulk owns the entry, resets and retries.
 func (mcm *multiConnectionManager) waitRetirement(ctx context.Context, entry *portEntry) error {
 	mcm.mu.Lock()
+	// Allow retry of a completed failed attempt when not bulk-owned
+	if entry.cleanupAttempt != nil && entry.cleanupAttempt.err != nil &&
+		!entry.cleanupRunning && mcm.activeBulk == nil {
+		entry.cleanupAttempt = nil
+	}
 	if entry.cleanupAttempt == nil {
 		go mcm.retireEntry(entry)
 	}

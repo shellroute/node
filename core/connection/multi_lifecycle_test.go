@@ -289,14 +289,12 @@ func TestBlockedConnectVsIndividualDisconnect(t *testing.T) {
 	go func() {
 		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
-	// Wait for manager creation via channel check instead of busy-spin
-	deadline := time.After(5 * time.Second)
-	for created.len() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("manager was not created")
-		default:
-		}
+	// Wait for connect to block on gate — once Connect returns or manager is
+	// created, we know it's inside. Short sleep is acceptable here because the
+	// gate controls determinism, not the sleep.
+	time.Sleep(50 * time.Millisecond)
+	if created.len() == 0 {
+		t.Fatal("manager was not created")
 	}
 
 	discDone := make(chan error, 1)
@@ -608,5 +606,65 @@ func TestReconnectSucceeds(t *testing.T) {
 
 	if n := registryLen(mcm); n != 1 {
 		t.Errorf("expected 1 current entry, got %d", n)
+	}
+}
+
+// --- Invariant 7: individual disconnect retries failed cleanup ---
+
+// failOnceManager fails Disconnect once, then succeeds.
+type failOnceManager struct {
+	mockManager
+	calls atomic.Int32
+}
+
+func (m *failOnceManager) Disconnect() error {
+	n := m.calls.Add(1)
+	if n == 1 {
+		return errors.New("transient cleanup error")
+	}
+	m.mu.Lock()
+	m.connected = false
+	m.mu.Unlock()
+	return nil
+}
+
+func TestIndividualDisconnectRetriesFailedCleanup(t *testing.T) {
+	var mgr *failOnceManager
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &failOnceManager{}
+		mgr = m
+		return m
+	})
+
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// First disconnect — cleanup fails
+	err1 := mcm.Disconnect(bg(), 100)
+	if err1 == nil {
+		t.Fatal("first disconnect should fail")
+	}
+	if mgr.calls.Load() != 1 {
+		t.Fatalf("expected 1 cleanup call, got %d", mgr.calls.Load())
+	}
+
+	// Entry should still be retiring (not removed)
+	if n := retiringLen(mcm); n != 1 {
+		t.Fatalf("entry should remain retiring, got %d", n)
+	}
+
+	// Second disconnect — retry succeeds
+	err2 := mcm.Disconnect(bg(), 100)
+	if err2 != nil {
+		t.Errorf("second disconnect should succeed, got %v", err2)
+	}
+	if mgr.calls.Load() != 2 {
+		t.Errorf("expected 2 cleanup calls, got %d", mgr.calls.Load())
+	}
+
+	// Entry should be fully removed
+	if n := retiringLen(mcm); n != 0 {
+		t.Errorf("retiring should be empty, got %d", n)
 	}
 }

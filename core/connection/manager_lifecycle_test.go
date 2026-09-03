@@ -111,30 +111,30 @@ func TestDisconnectContextSharesRunningCleanup(t *testing.T) {
 	}
 }
 
-func TestConnectContextPreservesCallerCancellationFromWait(t *testing.T) {
-	tc := &testContext{}
-	tc.SetT(t)
-	tc.SetupTest()
-	// Empty state sequence — Connect will block in waitForConnectedState
-	tc.fakeConnectionFactory.mockConnection.onStartReportStates = []fakeState{}
+func TestConnectContextPreservesCallerCancellationFromLookup(t *testing.T) {
+	// Uses a bare connectionManager with a blocking lookup to verify
+	// that cancellation during establishment preserves both
+	// ErrConnectionCancelled and the concrete ctx error for 503 mapping.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m := &connectionManager{
+		status:   connectionstate.Status{State: connectionstate.NotConnected},
+		eventBus: mocks.NewEventBus(),
+	}
+	lookup := func() (*proposal.PricedServiceProposal, error) {
+		close(started)
+		<-release
+		return &proposal.PricedServiceProposal{}, nil
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- tc.connManager.ConnectContext(ctx, consumerID, hermesID, activeProposalLookup, ConnectParams{})
+		done <- m.ConnectContext(ctx, identity.Identity{}, common.Address{}, lookup, ConnectParams{})
 	}()
-
-	deadline := time.After(time.Second)
-	for tc.connManager.Status().State != connectionstate.Connecting {
-		select {
-		case err := <-done:
-			t.Fatalf("ConnectContext returned before cancellation: %v", err)
-		case <-deadline:
-			t.Fatal("never entered connecting state")
-		default:
-		}
-	}
+	<-started
 	cancel()
+	close(release)
 
 	select {
 	case err := <-done:
