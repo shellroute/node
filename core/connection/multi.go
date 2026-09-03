@@ -70,6 +70,11 @@ type portEntry struct {
 	// Cleanup must wait for this before starting Disconnect.
 	operationDone chan struct{}
 
+	// opCancel cancels the coordinator-owned operation context passed to
+	// the lifecycleManager. Extracted under mu, invoked outside mu by
+	// individual/bulk retirement. Nil after worker finalizes.
+	opCancel context.CancelFunc
+
 	// cleanupRunning is true while a Disconnect call is in-flight on the manager.
 	cleanupRunning bool
 	// cleanupAttempt points to the current cleanup attempt. Nil until cleanup starts.
@@ -169,13 +174,16 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		mcm.mu.Unlock()
 		return ErrAlreadyExists
 	}
-	// Reserve with nil manager — filled after construction
+	// Reserve with nil manager — filled after construction.
+	// Create coordinator-owned operation context derived from caller ctx.
+	opCtx, opCancel := context.WithCancel(ctx)
 	opDone := make(chan struct{})
 	entry := &portEntry{
 		port:          params.ProxyPort,
 		generation:    mcm.generation,
 		phase:         phaseConnecting,
 		operationDone: opDone,
+		opCancel:      opCancel,
 	}
 	mcm.current[params.ProxyPort] = entry
 	gen := mcm.generation
@@ -187,8 +195,9 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	mcm.mu.Lock()
 	entry.manager = m
 	// Check if superseded during factory construction (bulk/ctx may have advanced)
-	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired || ctx.Err() != nil {
+	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired || opCtx.Err() != nil {
 		entry.phase = phaseRetiring
+		entry.opCancel = nil
 		if mcm.current[params.ProxyPort] == entry {
 			delete(mcm.current, params.ProxyPort)
 		}
@@ -196,6 +205,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		close(opDone)
 		mcm.stateChanged()
 		mcm.mu.Unlock()
+		opCancel()
 		go mcm.retireEntry(entry)
 		if ctx.Err() != nil {
 			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
@@ -210,12 +220,13 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 	go func() {
 		var connectErr error
 		if lm, ok := m.(lifecycleManager); ok {
-			connectErr = lm.ConnectContext(ctx, consumerID, hermesID, proposalLookup, params)
+			connectErr = lm.ConnectContext(opCtx, consumerID, hermesID, proposalLookup, params)
 		} else {
 			connectErr = m.Connect(consumerID, hermesID, proposalLookup, params)
 		}
 
 		mcm.mu.Lock()
+		entry.opCancel = nil // worker done — clear cancel
 
 		if entry.phase == phaseRetiring {
 			// Caller or bulk cancelled — we own cleanup
@@ -227,7 +238,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 		}
 
 		if connectErr == nil && mcm.current[params.ProxyPort] == entry &&
-			mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
+			mcm.generation == gen && !mcm.reconcileRequired && opCtx.Err() == nil {
 			entry.phase = phaseActive
 			resultErr = nil
 			close(opDone)
@@ -271,7 +282,12 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 			mcm.retiring[params.ProxyPort] = entry
 			mcm.stateChanged()
 		}
+		cancelFn := entry.opCancel
+		entry.opCancel = nil
 		mcm.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
 		mcm.cancelManager(m)
 		if alreadyRetiring {
 			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
@@ -324,10 +340,15 @@ func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) error
 	delete(mcm.current, id)
 	e.phase = phaseRetiring
 	mcm.retiring[id] = e
+	cancelFn := e.opCancel
+	e.opCancel = nil
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	// Cancel in-flight connect/reconnect
+	// Cancel coordinator-owned operation context + manager
+	if cancelFn != nil {
+		cancelFn()
+	}
 	mcm.cancelManager(e.manager)
 
 	return mcm.waitRetirement(ctx, e)
@@ -405,7 +426,7 @@ func (mcm *multiConnectionManager) retireEntry(entry *portEntry) {
 	}
 
 	// Use DisconnectContext with hard deadline to prevent unbounded hangs
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), mcm.BulkTimeout)
 	defer cleanupCancel()
 	var err error
 	if lm, ok := m.(lifecycleManager); ok {
@@ -491,12 +512,17 @@ func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
 func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
 
-	// Collect managers under lock, cancel outside
+	// Collect managers and opCancels under lock, cancel outside
 	mcm.mu.Lock()
 	var toCancel []Manager
+	var opCancels []context.CancelFunc
 	for _, e := range mcm.retiring {
 		if e.manager != nil {
 			toCancel = append(toCancel, e.manager)
+		}
+		if e.opCancel != nil {
+			opCancels = append(opCancels, e.opCancel)
+			e.opCancel = nil
 		}
 	}
 	// Start missing cleanup attempts
@@ -506,6 +532,9 @@ func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
 		}
 	}
 	mcm.mu.Unlock()
+	for _, cancel := range opCancels {
+		cancel()
+	}
 	for _, m := range toCancel {
 		mcm.cancelManager(m)
 	}
@@ -606,10 +635,11 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 	gen := mcm.generation
 	m := e.manager
 	e.phase = phaseReconnecting
-	// New operationDone for this reconnect — cleanup must wait for it
+	// Coordinator-owned operation context for this reconnect
+	opCtx, opCancel := context.WithCancel(ctx)
 	opDone := make(chan struct{})
 	e.operationDone = opDone
-	e.cleanupAttempt = nil // reset any prior attempt
+	e.opCancel = opCancel
 	mcm.stateChanged()
 	mcm.mu.Unlock()
 
@@ -617,12 +647,13 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 	go func() {
 		var reconErr error
 		if lm, ok := m.(lifecycleManager); ok {
-			reconErr = lm.ReconnectContext(ctx)
+			reconErr = lm.ReconnectContext(opCtx)
 		} else {
 			m.Reconnect()
 		}
 
 		mcm.mu.Lock()
+		e.opCancel = nil // worker done — clear cancel
 
 		if e.phase == phaseRetiring {
 			resultErr = fmt.Errorf("%w: %w", ErrConnectionCancelled, ErrLifecycleBusy)
@@ -632,7 +663,7 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 			return
 		}
 
-		if reconErr == nil && mcm.generation == gen && !mcm.reconcileRequired && ctx.Err() == nil {
+		if reconErr == nil && mcm.generation == gen && !mcm.reconcileRequired && opCtx.Err() == nil {
 			e.phase = phaseActive
 			resultErr = nil
 			close(opDone)
@@ -673,7 +704,12 @@ func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) error 
 			mcm.retiring[id] = e
 			mcm.stateChanged()
 		}
+		cancelFn := e.opCancel
+		e.opCancel = nil
 		mcm.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
 		mcm.cancelManager(m)
 		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}

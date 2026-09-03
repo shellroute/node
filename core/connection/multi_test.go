@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -575,6 +576,110 @@ func TestGatewayRetryAfterTimeout(t *testing.T) {
 	// Connect after successful reconciliation should work
 	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
 		t.Errorf("connect after resolved reconciliation should work, got %v", err)
+	}
+}
+
+// --- Bulk cancels reconnect operation context test (msg 876) ---
+
+// phasedReconnectManager tracks disconnect and connect phases during ReconnectContext.
+// It blocks on disconnectGate during disconnect, then checks context before connect.
+type phasedReconnectManager struct {
+	mockManager
+	disconnectGate chan struct{} // blocks during disconnect phase
+	connectStarted atomic.Int32  // incremented if fresh connect phase begins
+}
+
+func (m *phasedReconnectManager) ConnectContext(ctx context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
+	m.connectStarted.Add(1)
+	return m.Connect(identity.Identity{}, common.Address{}, nil, ConnectParams{})
+}
+func (m *phasedReconnectManager) CancelCurrentOperation() {}
+func (m *phasedReconnectManager) DisconnectContext(ctx context.Context) error {
+	// Simulate slow disconnect that respects context
+	select {
+	case <-m.disconnectGate:
+		return m.Disconnect()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (m *phasedReconnectManager) ReconnectContext(ctx context.Context) error {
+	// Phase 1: disconnect
+	err := m.DisconnectContext(ctx)
+	if err != nil && !errors.Is(err, ErrNoConnection) {
+		return err
+	}
+	// Phase 2: check context — bulk must have cancelled by now
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+	// Phase 3: fresh connect — should NOT reach here if bulk cancelled
+	m.connectStarted.Add(1)
+	return m.ConnectContext(ctx, identity.Identity{}, common.Address{}, nil, ConnectParams{})
+}
+
+func TestBulkCancelsReconnectBeforeFreshConnect(t *testing.T) {
+	disconnectGate := make(chan struct{})
+	var mgr *phasedReconnectManager
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &phasedReconnectManager{disconnectGate: disconnectGate}
+		mgr = m
+		return m
+	})
+	mcm.BulkTimeout = 5 * time.Second
+
+	// Establish connection
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	// Reset counter — initial Connect calls ConnectContext
+	mgr.connectStarted.Store(0)
+
+	// Start reconnect — will block in disconnect phase
+	reconDone := make(chan error, 1)
+	go func() {
+		reconDone <- mcm.Reconnect(bg(), 100)
+	}()
+
+	// Wait for reconnect to enter disconnect phase
+	time.Sleep(50 * time.Millisecond)
+
+	// Start bulk disconnect — should cancel reconnect's operation context.
+	// Do NOT close the gate yet — bulk's opCancel must propagate first.
+	bulkDone := make(chan error, 1)
+	go func() {
+		bulkDone <- mcm.Disconnect(bg(), -1)
+	}()
+
+	// Give bulk time to extract and invoke opCancel. The reconnect's
+	// DisconnectContext selects on ctx.Done(), so opCancel makes it return
+	// before the gate closes.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now close the gate as a safety valve (in case opCancel didn't wake
+	// the select, the test would hang otherwise).
+	close(disconnectGate)
+
+	// Both should complete
+	select {
+	case err := <-reconDone:
+		_ = err // reconnect should fail (cancelled or lifecycle busy)
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconnect did not complete")
+	}
+
+	select {
+	case err := <-bulkDone:
+		if err != nil {
+			t.Logf("bulk disconnect result: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("bulk disconnect did not complete")
+	}
+
+	// Key assertion: fresh connect phase must NOT have started
+	if n := mgr.connectStarted.Load(); n > 0 {
+		t.Errorf("bulk cancellation allowed ReconnectContext to start %d fresh connect phase(s)", n)
 	}
 }
 

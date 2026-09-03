@@ -266,16 +266,20 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	// Cancel lifetime ctx if caller ctx expires during establishment
 	stopAfterFunc := context.AfterFunc(ctx, lifetimeCancel)
 
-	// Error cleanup — always cancel lifetime ctx on error.
-	// DisconnectContext only if state moved past NotConnected.
+	// Error cleanup — always cancel lifetime ctx and attempt disconnect.
+	// DisconnectContext is unconditional: it returns ErrNoConnection harmlessly
+	// if state is still NotConnected, but correctly attaches to running cleanup
+	// if another goroutine already started it.
 	defer func() {
 		if err != nil {
 			stopAfterFunc()
 			lifetimeCancel()
-			log.Err(err).Msg("Connect failed, disconnecting")
-			if m.Status().State != connectionstate.NotConnected {
-				m.DisconnectContext(context.Background())
+			// Normalize cancellation errors so TequilAPI maps 503 not 422
+			if ctx.Err() != nil && !errors.Is(err, ErrConnectionCancelled) {
+				err = fmt.Errorf("%w: %w", ErrConnectionCancelled, errors.Join(err, ctx.Err()))
 			}
+			log.Err(err).Msg("Connect failed, disconnecting")
+			m.DisconnectContext(context.Background())
 		}
 	}()
 
@@ -311,6 +315,11 @@ func (m *connectionManager) ConnectContext(ctx context.Context, consumerID ident
 	}
 
 	m.statusConnecting(consumerID, hermesID, *proposal)
+
+	m.addCleanup(func() error {
+		m.clearIPCache()
+		return nil
+	})
 
 	m.connectOptions = ConnectOptions{
 		ConsumerID:     consumerID,
@@ -936,12 +945,16 @@ func (m *connectionManager) DisconnectContext(ctx context.Context) error {
 	// Launch cleanup in goroutine — all callers (including starter) select
 	go func() {
 		m.runDisconnectCleanup()
-		att.err = nil
-		close(att.done)
-
+		// Clear pointer before closing done — prevents ReconnectContext
+		// from waking and racing a concurrent DisconnectContext that
+		// would attach to this already-completed attempt.
 		m.discoAttemptMu.Lock()
-		m.discoAttempt = nil
+		att.err = nil
+		if m.discoAttempt == att {
+			m.discoAttempt = nil
+		}
 		m.discoAttemptMu.Unlock()
+		close(att.done)
 	}()
 
 	// Starter waits same as everyone else
