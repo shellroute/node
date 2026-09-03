@@ -20,6 +20,10 @@ package connection
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/pprof"
+	"sort"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -56,6 +60,7 @@ type portEntry struct {
 	generation uint64
 	manager    Manager
 	phase      entryPhase
+	priorPhase entryPhase // phase before retirement, for diagnostics
 
 	// operationDone is closed when the Connect/Reconnect worker finishes.
 	// Cleanup must wait for this before starting Disconnect.
@@ -84,6 +89,13 @@ type cleanupAttempt struct {
 type bulkOp struct {
 	done chan struct{} // closed when the operation completes
 	err  error         // result
+}
+
+// retire transitions an entry to phaseRetiring, preserving the prior phase
+// for diagnostics. Must be called under mu.
+func (e *portEntry) retire() {
+	e.priorPhase = e.phase
+	e.phase = phaseRetiring
 }
 
 // stateChanged closes the current notify channel and replaces it.
@@ -206,5 +218,214 @@ func (mcm *multiConnectionManager) cancelManager(m Manager) {
 	}
 	if c, ok := m.(canceller); ok {
 		c.CancelCurrentOperation()
+	}
+}
+
+// disconnectAll performs authoritative bulk cleanup. Concurrent callers
+// share the same operation. The bulk worker runs in its own server-owned
+// goroutine — HTTP callers only wait on the result channel.
+func (mcm *multiConnectionManager) disconnectAll(ctx context.Context) error {
+	mcm.mu.Lock()
+
+	// Attach to existing bulk operation if one is active
+	if mcm.activeBulk != nil {
+		bulk := mcm.activeBulk
+		gen := mcm.generation
+		mcm.mu.Unlock()
+		select {
+		case <-bulk.done:
+			return bulk.err
+		case <-ctx.Done():
+			log.Warn().Uint64("generation", gen).
+				Msg("Caller timed out while attached to shared bulk cleanup")
+			return ctx.Err()
+		}
+	}
+
+	// Start new bulk operation — server-owned goroutine
+	// Only advance generation on first reconcile; retries keep the same generation
+	if !mcm.reconcileRequired {
+		mcm.reconcileRequired = true
+		mcm.generation++
+	}
+	gen := mcm.generation
+
+	// Move current entries to retiring
+	for port, e := range mcm.current {
+		e.retire()
+		mcm.retiring[port] = e
+		delete(mcm.current, port)
+	}
+
+	// Clear prior failed attempts so retireEntry can create a new one
+	for _, e := range mcm.retiring {
+		if e.cleanupAttempt != nil && e.cleanupAttempt.err != nil && !e.cleanupRunning {
+			e.cleanupAttempt = nil // old attempt stays immutable; new one created on retry
+		}
+	}
+
+	bulk := &bulkOp{done: make(chan struct{})}
+	mcm.activeBulk = bulk
+	mcm.stateChanged()
+	mcm.mu.Unlock()
+
+	// Launch server-owned bulk worker
+	go mcm.bulkWorker(bulk, gen)
+
+	// Caller waits for result or ctx cancellation
+	select {
+	case <-bulk.done:
+		return bulk.err
+	case <-ctx.Done():
+		log.Warn().Uint64("generation", gen).
+			Msg("Caller timed out while shared bulk cleanup continues server-side")
+		return ctx.Err()
+	}
+}
+
+// bulkWorker is the server-owned goroutine that drives bulk cleanup to
+// completion. It cancels in-flight ops, starts missing cleanups, and waits
+// for all retiring entries to resolve. Never exits until done or timed out.
+func (mcm *multiConnectionManager) bulkWorker(bulk *bulkOp, gen uint64) {
+	bulkStart := time.Now()
+	log.Info().Uint64("generation", gen).Msg("Bulk disconnect started")
+
+	// Collect managers and opCancels under lock, cancel outside
+	mcm.mu.Lock()
+	var toCancel []Manager
+	var opCancels []context.CancelFunc
+	for _, e := range mcm.retiring {
+		if e.manager != nil {
+			toCancel = append(toCancel, e.manager)
+		}
+		if e.opCancel != nil {
+			opCancels = append(opCancels, e.opCancel)
+			e.opCancel = nil
+		}
+	}
+	// Start missing cleanup attempts
+	for _, e := range mcm.retiring {
+		if !e.cleanupRunning && e.cleanupAttempt == nil {
+			go mcm.retireEntry(e)
+		}
+	}
+	mcm.mu.Unlock()
+	for _, cancel := range opCancels {
+		cancel()
+	}
+	for _, m := range toCancel {
+		mcm.cancelManager(m)
+	}
+
+	deadline := time.After(mcm.BulkTimeout)
+	for {
+		mcm.mu.Lock()
+		if len(mcm.retiring) == 0 {
+			mcm.reconcileRequired = false
+			mcm.activeBulk = nil
+			bulk.err = nil
+			close(bulk.done)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			log.Info().Uint64("generation", gen).Dur("elapsed", time.Since(bulkStart)).
+				Msg("Bulk disconnect completed successfully")
+			return
+		}
+
+		// Check for cleanup errors — fail the bulk attempt immediately,
+		// retain reconcileRequired so next request retries
+		var pendingPorts []int
+		var cleanupErrs []error
+		for port, e := range mcm.retiring {
+			if e.cleanupAttempt != nil && e.cleanupAttempt.err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("port %d: %w", port, e.cleanupAttempt.err))
+			}
+			if e.cleanupRunning || e.cleanupAttempt == nil || (e.cleanupAttempt != nil && e.cleanupAttempt.err != nil) {
+				pendingPorts = append(pendingPorts, port)
+			}
+		}
+		if len(cleanupErrs) > 0 {
+			// End this bulk attempt — keep reconcileRequired, don't advance generation
+			err := fmt.Errorf("%w: bulk cleanup failed: %w", ErrLifecycleBusy, errors.Join(cleanupErrs...))
+			nRetiring := len(mcm.retiring)
+			mcm.activeBulk = nil
+			bulk.err = err
+			close(bulk.done)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			sort.Ints(pendingPorts)
+			log.Error().Err(err).Uint64("generation", gen).
+				Dur("elapsed", time.Since(bulkStart)).
+				Int("retiring_count", nRetiring).Ints("pending_ports", pendingPorts).
+				Msg("Bulk disconnect failed with cleanup error")
+			return
+		}
+
+		wait := mcm.notify
+		mcm.mu.Unlock()
+
+		select {
+		case <-wait:
+			continue
+		case <-deadline:
+			mcm.mu.Lock()
+			// Snapshot state for diagnostics — includes prior phase identity
+			var cleanupRunningPorts, cleanupPendingPorts []int
+			var wasConnecting, wasReconnecting, wasActive []int
+			for port, e := range mcm.retiring {
+				if e.cleanupRunning {
+					cleanupRunningPorts = append(cleanupRunningPorts, port)
+				} else {
+					cleanupPendingPorts = append(cleanupPendingPorts, port)
+				}
+				switch e.priorPhase {
+				case phaseConnecting:
+					wasConnecting = append(wasConnecting, port)
+				case phaseReconnecting:
+					wasReconnecting = append(wasReconnecting, port)
+				case phaseActive:
+					wasActive = append(wasActive, port)
+				}
+			}
+			nCurrent := len(mcm.current)
+			nRetiring := len(mcm.retiring)
+
+			if mcm.dumpedGen != gen {
+				mcm.dumpedGen = gen
+				mcm.mu.Unlock()
+				sort.Ints(pendingPorts)
+				sort.Ints(cleanupRunningPorts)
+				sort.Ints(cleanupPendingPorts)
+				sort.Ints(wasConnecting)
+				sort.Ints(wasReconnecting)
+				sort.Ints(wasActive)
+				log.Warn().Uint64("generation", gen).
+					Ints("pending_ports", pendingPorts).
+					Ints("cleanup_running", cleanupRunningPorts).
+					Ints("cleanup_pending", cleanupPendingPorts).
+					Ints("was_connecting", wasConnecting).
+					Ints("was_reconnecting", wasReconnecting).
+					Ints("was_active", wasActive).
+					Int("current_count", nCurrent).Int("retiring_count", nRetiring).
+					Dur("elapsed", time.Since(bulkStart)).
+					Msg("Bulk disconnect timeout — dumping goroutines")
+				pprof.Lookup("goroutine").WriteTo(log.Logger, 2)
+			} else {
+				mcm.mu.Unlock()
+			}
+
+			sort.Ints(pendingPorts)
+			err := fmt.Errorf("%w: bulk disconnect timeout after %s, pending ports: %v", ErrLifecycleBusy, mcm.BulkTimeout, pendingPorts)
+			mcm.mu.Lock()
+			mcm.activeBulk = nil
+			bulk.err = err
+			close(bulk.done)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			log.Error().Err(err).Uint64("generation", gen).
+				Dur("elapsed", time.Since(bulkStart)).
+				Msg("Bulk disconnect failed")
+			return
+		}
 	}
 }

@@ -459,3 +459,154 @@ func TestRaceStressConnectDisconnect(t *testing.T) {
 		t.Errorf("retiring should be empty after stress, got %d", n)
 	}
 }
+
+// --- Bulk timeout and retry tests ---
+
+// blockingDisconnectManager blocks on Disconnect until gate is closed
+type blockingDisconnectManager struct {
+	mockManager
+	gate chan struct{}
+}
+
+func (m *blockingDisconnectManager) Disconnect() error {
+	<-m.gate
+	return nil
+}
+
+func TestBulkTimeoutReturnsFalse(t *testing.T) {
+	gate := make(chan struct{})
+	mcm := NewMultiConnectionManager(func() Manager {
+		return &mockManager{}
+	})
+	mcm.BulkTimeout = 100 * time.Millisecond
+
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	blockingMgr := &blockingDisconnectManager{gate: gate}
+	mcm.mu.Lock()
+	mcm.current[100].manager = blockingMgr
+	mcm.mu.Unlock()
+
+	err := mcm.Disconnect(bg(), -1)
+	close(gate)
+
+	if err == nil {
+		t.Error("bulk timeout should return error")
+	}
+
+	mcm.mu.Lock()
+	reconcileRequired := mcm.reconcileRequired
+	mcm.mu.Unlock()
+	if !reconcileRequired {
+		t.Error("reconcileRequired should remain true after timeout")
+	}
+}
+
+func TestGatewayRetryAfterTimeout(t *testing.T) {
+	gate := make(chan struct{})
+	mcm := NewMultiConnectionManager(func() Manager {
+		return &blockingDisconnectManager{gate: gate}
+	})
+	mcm.BulkTimeout = 100 * time.Millisecond
+
+	mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+
+	err1 := mcm.Disconnect(bg(), -1)
+	if err1 == nil {
+		t.Fatal("first bulk should timeout")
+	}
+	if !errors.Is(err1, ErrLifecycleBusy) {
+		t.Errorf("expected ErrLifecycleBusy, got %v", err1)
+	}
+
+	err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
+	if !errors.Is(err, ErrLifecycleBusy) {
+		t.Errorf("connect during unresolved reconciliation should return ErrLifecycleBusy, got %v", err)
+	}
+
+	close(gate)
+
+	err2 := mcm.Disconnect(bg(), -1)
+	if err2 != nil {
+		t.Errorf("second bulk should succeed, got %v", err2)
+	}
+
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("current should be empty, got %d", n)
+	}
+	if n := retiringLen(mcm); n != 0 {
+		t.Errorf("retiring should be empty, got %d", n)
+	}
+
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(300)); err != nil {
+		t.Errorf("connect after resolved reconciliation should work, got %v", err)
+	}
+}
+
+// --- Reconnect tests ---
+
+type reconnectableManager struct {
+	mockManager
+	reconnectErr error
+}
+
+func (m *reconnectableManager) ConnectContext(_ context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
+	return m.Connect(identity.Identity{}, common.Address{}, nil, ConnectParams{})
+}
+func (m *reconnectableManager) CancelCurrentOperation() {}
+func (m *reconnectableManager) DisconnectContext(_ context.Context) error {
+	return m.Disconnect()
+}
+func (m *reconnectableManager) ReconnectContext(_ context.Context) error {
+	return m.reconnectErr
+}
+
+func TestReconnectPropagatesError(t *testing.T) {
+	wantErr := errors.New("reconnect failed")
+	created := &managersSlice{}
+	mcm := NewMultiConnectionManager(func() Manager {
+		m := &reconnectableManager{}
+		created.add(&m.mockManager)
+		return m
+	})
+
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	mcm.mu.Lock()
+	rm := mcm.current[100].manager.(*reconnectableManager)
+	rm.reconnectErr = wantErr
+	mcm.mu.Unlock()
+
+	err := mcm.Reconnect(bg(), 100)
+	if err == nil {
+		t.Fatal("expected error from failed reconnect")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected %v, got %v", wantErr, err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if n := registryLen(mcm); n != 0 {
+		t.Errorf("failed reconnect should remove from current, got %d", n)
+	}
+}
+
+func TestReconnectSucceeds(t *testing.T) {
+	mcm := NewMultiConnectionManager(func() Manager {
+		return &reconnectableManager{}
+	})
+
+	if err := mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100)); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	if err := mcm.Reconnect(bg(), 100); err != nil {
+		t.Errorf("reconnect should succeed, got %v", err)
+	}
+
+	if n := registryLen(mcm); n != 1 {
+		t.Errorf("expected 1 current entry, got %d", n)
+	}
+}
