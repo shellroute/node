@@ -96,6 +96,12 @@ func (tc *testContext) SetupTest() {
 	tc.Lock()
 	defer tc.Unlock()
 
+	// Reset package-level activeProposal price mutated by TestDisconnectDueToPriceDrop
+	activeProposal.Price = market.Price{
+		PricePerHour: big.NewInt(1),
+		PricePerGiB:  big.NewInt(2),
+	}
+
 	tc.stubPublisher = mocks.NewEventBus()
 	tc.mockStatistics = connectionstate.Statistics{
 		BytesReceived: 10,
