@@ -145,3 +145,78 @@ func TestBulkCancelsReconnectBeforeFreshConnect(t *testing.T) {
 		t.Errorf("bulk cancellation allowed ReconnectContext to start %d fresh connect phase(s)", n)
 	}
 }
+
+// slowConnectManager blocks on connectGate during ConnectContext, allowing
+// concurrent Stats calls to hit the connecting phase.
+type slowConnectManager struct {
+	mockManager
+	connectGate    chan struct{}
+	connectEntered chan struct{} // closed when ConnectContext blocks
+}
+
+func (m *slowConnectManager) ConnectContext(ctx context.Context, _ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
+	close(m.connectEntered)
+	select {
+	case <-m.connectGate:
+		m.mu.Lock()
+		m.connected = true
+		m.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (m *slowConnectManager) CancelCurrentOperation() {}
+func (m *slowConnectManager) DisconnectContext(_ context.Context) error {
+	return m.Disconnect()
+}
+func (m *slowConnectManager) ReconnectContext(_ context.Context) error { return nil }
+
+func TestStatsSafeDuringConnect(t *testing.T) {
+	connectGate := make(chan struct{})
+	connectEntered := make(chan struct{})
+	mcm := NewMultiConnectionManager(func() Manager {
+		return &slowConnectManager{
+			connectGate:    connectGate,
+			connectEntered: connectEntered,
+		}
+	})
+
+	// Start connect — blocks in ConnectContext
+	connectDone := make(chan error, 1)
+	go func() {
+		connectDone <- mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(100))
+	}()
+
+	// Wait for connect to enter the blocking phase
+	select {
+	case <-connectEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect did not enter blocking phase")
+	}
+
+	// Concurrent Stats must return zero without race/panic
+	stats := mcm.Stats(100)
+	if stats.BytesReceived != 0 || stats.BytesSent != 0 {
+		t.Errorf("stats during connecting should be zero, got %+v", stats)
+	}
+
+	// Status is safe during any phase
+	status := mcm.Status(100)
+	_ = status // no panic = pass
+
+	// Unblock connect
+	close(connectGate)
+	select {
+	case err := <-connectDone:
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect did not complete")
+	}
+
+	// After active, Stats should work normally
+	stats = mcm.Stats(100)
+	_ = stats // no panic = pass
+}

@@ -297,6 +297,7 @@ func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID ident
 }
 
 // Status queries current status of connection.
+// Safe during any phase — manager.Status() uses its own statusLock.
 func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
 	mcm.mu.Lock()
 	e, ok := mcm.current[id]
@@ -308,12 +309,18 @@ func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
 }
 
 // Stats provides connection statistics information.
+// Only returns stats from active entries — connecting/reconnecting managers
+// may not have initialized statsTracker yet (plan invariant 8).
 func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 	mcm.mu.Lock()
 	e, ok := mcm.current[id]
+	var m Manager
+	if ok && e.phase == phaseActive && e.manager != nil {
+		m = e.manager
+	}
 	mcm.mu.Unlock()
-	if ok && e.manager != nil {
-		return e.manager.Stats()
+	if m != nil {
+		return m.Stats()
 	}
 	return connectionstate.Statistics{}
 }
