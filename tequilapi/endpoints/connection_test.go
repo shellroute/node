@@ -56,7 +56,7 @@ type mockConnectionManager struct {
 	requestedServiceType string
 }
 
-func (cm *mockConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup connection.ProposalLookup, options connection.ConnectParams) error {
+func (cm *mockConnectionManager) Connect(_ context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup connection.ProposalLookup, options connection.ConnectParams) error {
 	proposal, _ := proposalLookup()
 	if proposal == nil {
 		return errors.New("no proposal")
@@ -77,7 +77,7 @@ func (cm *mockConnectionManager) Stats(int) connectionstate.Statistics {
 	return connectionstate.Statistics{}
 }
 
-func (cm *mockConnectionManager) Disconnect(int) error {
+func (cm *mockConnectionManager) Disconnect(_ context.Context, _ int) error {
 	cm.disconnectCount++
 	return cm.onDisconnectReturn
 }
@@ -86,8 +86,8 @@ func (cm *mockConnectionManager) CheckChannel(context.Context) error {
 	return cm.onCheckChannelReturn
 }
 
-func (cm *mockConnectionManager) Reconnect(int) {
-	return
+func (cm *mockConnectionManager) Reconnect(_ context.Context, _ int) error {
+	return nil
 }
 
 func mockRepositoryWithProposal(providerID, serviceType string) *mockProposalRepository {
@@ -534,6 +534,84 @@ func TestConnectReturnsErrorIfNoProposals(t *testing.T) {
 	g.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusInternalServerError, resp.Code)
+}
+
+// ctxCapturingManager records the context passed to Connect/Disconnect.
+type ctxCapturingManager struct {
+	mockConnectionManager
+	lastConnectCtx    context.Context
+	lastDisconnectCtx context.Context
+}
+
+func (cm *ctxCapturingManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup connection.ProposalLookup, options connection.ConnectParams) error {
+	cm.lastConnectCtx = ctx
+	return cm.mockConnectionManager.Connect(ctx, consumerID, hermesID, proposalLookup, options)
+}
+
+func (cm *ctxCapturingManager) Disconnect(ctx context.Context, id int) error {
+	cm.lastDisconnectCtx = ctx
+	return cm.mockConnectionManager.Disconnect(ctx, id)
+}
+
+func TestCreateMaps503(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"lifecycle_busy", connection.ErrLifecycleBusy, http.StatusServiceUnavailable},
+		{"context_canceled", context.Canceled, http.StatusServiceUnavailable},
+		{"context_deadline", context.DeadlineExceeded, http.StatusServiceUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := &ctxCapturingManager{mockConnectionManager: mockConnectionManager{onConnectReturn: tt.err}}
+			proposalProvider := mockRepositoryWithProposal("required-node", "wireguard")
+			type ctxKey struct{}
+			req := httptest.NewRequest(http.MethodPut, "/connection", strings.NewReader(`{
+				"consumer_id": "0x1",
+				"provider_id": "required-node",
+				"hermes_id": "hermes",
+				"service_type": "wireguard"
+			}`))
+			req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, "marker"))
+			resp := httptest.NewRecorder()
+			g := summonTestGin()
+			err := AddRoutesForConnection(manager, &mockStateProvider{}, proposalProvider, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+			assert.NoError(t, err)
+			g.ServeHTTP(resp, req)
+			assert.Equal(t, tt.wantStatus, resp.Code)
+			assert.Equal(t, "marker", manager.lastConnectCtx.Value(ctxKey{}), "request context must propagate")
+		})
+	}
+}
+
+func TestDeleteMaps503AndSuccess(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"lifecycle_busy", connection.ErrLifecycleBusy, http.StatusServiceUnavailable},
+		{"context_canceled", context.Canceled, http.StatusServiceUnavailable},
+		{"context_deadline", context.DeadlineExceeded, http.StatusServiceUnavailable},
+		{"success", nil, http.StatusAccepted},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			type ctxKey struct{}
+			manager := &ctxCapturingManager{mockConnectionManager: mockConnectionManager{onDisconnectReturn: tt.err}}
+			req := httptest.NewRequest(http.MethodDelete, "/connection", nil)
+			req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, "marker"))
+			resp := httptest.NewRecorder()
+			g := summonTestGin()
+			err := AddRoutesForConnection(manager, nil, &mockProposalRepository{}, mockIdentityRegistryInstance, eventbus.New(), &mockAddressProvider{})(g)
+			assert.NoError(t, err)
+			g.ServeHTTP(resp, req)
+			assert.Equal(t, tt.wantStatus, resp.Code)
+			assert.Equal(t, "marker", manager.lastDisconnectCtx.Value(ctxKey{}), "request context must propagate")
+		})
+	}
 }
 
 var mockIdentityRegistryInstance = &registry.FakeRegistry{RegistrationStatus: registry.Registered}

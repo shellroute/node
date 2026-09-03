@@ -57,7 +57,7 @@ type connectionManager interface {
 	// CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping
 	CheckChannel(context.Context) error
 	// Reconnect reconnects current session
-	Reconnect(int)
+	Reconnect(context.Context, int) error
 }
 
 // NewNotifier create sleep events notifier
@@ -83,7 +83,9 @@ func (n *Notifier) handleSleepEvent(e Event) {
 		defer cancel()
 		if err := n.connectionManager.CheckChannel(ctx); err != nil {
 			log.Info().Msgf("Channel dead - reconnecting: %s", err)
-			n.connectionManager.Reconnect(0)
+			if rerr := n.connectionManager.Reconnect(context.Background(), 0); rerr != nil {
+				log.Error().Err(rerr).Msg("Reconnect failed")
+			}
 		} else {
 			log.Info().Msg("Channel still alive - no need to reconnect")
 		}

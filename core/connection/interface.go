@@ -42,6 +42,16 @@ type Connection interface {
 // StateChannel is the channel we receive state change events on
 type StateChannel chan connectionstate.State
 
+// lifecycleManager extends Manager with context-aware and cancellable operations.
+// Production connectionManager implements this; the coordinator uses it via type assertion.
+type lifecycleManager interface {
+	Manager
+	ConnectContext(context.Context, identity.Identity, common.Address, ProposalLookup, ConnectParams) error
+	CancelCurrentOperation()
+	DisconnectContext(context.Context) error
+	ReconnectContext(context.Context) error
+}
+
 // Manager interface provides methods to manage connection
 type Manager interface {
 	// Connect creates new connection from given consumer to provider, reports error if connection already exists
@@ -61,15 +71,23 @@ type Manager interface {
 // MultiManager interface provides methods to manage connection
 type MultiManager interface {
 	// Connect creates new connection from given consumer to provider, reports error if connection already exists
-	Connect(consumerID identity.Identity, hermesID common.Address, proposal ProposalLookup, params ConnectParams) error
+	Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposal ProposalLookup, params ConnectParams) error
 	// Status queries current status of connection
 	Status(n int) connectionstate.Status
 	// Stats provides connection statistics information.
 	Stats(n int) connectionstate.Statistics
-	// Disconnect closes established connection, reports error if no connection
-	Disconnect(n int) error
+	// Disconnect closes established connection, reports error if no connection.
+	// id < 0 disconnects all connections (authoritative bulk cleanup).
+	Disconnect(ctx context.Context, id int) error
 	// CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping
 	CheckChannel(context.Context) error
 	// Reconnect reconnects current session
-	Reconnect(n int)
+	Reconnect(ctx context.Context, id int) error
 }
+
+// Compile-time interface assertions — prevent signature drift from
+// silently selecting the legacy Manager fallback path.
+var (
+	_ lifecycleManager = (*connectionManager)(nil)
+	_ MultiManager     = (*multiConnectionManager)(nil)
+)

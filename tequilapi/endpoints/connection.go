@@ -18,7 +18,9 @@
 package endpoints
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -142,6 +144,10 @@ func (ce *ConnectionEndpoint) Status(c *gin.Context) {
 //	    description: Internal server error
 //	    schema:
 //	      "$ref": "#/definitions/APIError"
+//	  503:
+//	    description: Lifecycle busy or request cancelled
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 	hermes, err := ce.addressProvider.GetActiveHermes(config.GetInt64(config.FlagChainID))
 	if err != nil {
@@ -204,13 +210,17 @@ func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 	}
 	proposalLookup := connection.FilteredProposals(f, cr.Filter.SortBy, ce.proposalRepository)
 
-	err = ce.manager.Connect(consumerID, common.HexToAddress(cr.HermesID), proposalLookup, getConnectOptions(cr))
+	err = ce.manager.Connect(c.Request.Context(), consumerID, common.HexToAddress(cr.HermesID), proposalLookup, getConnectOptions(cr))
 	if err != nil {
-		switch err {
-		case connection.ErrAlreadyExists:
+		if errors.Is(err, connection.ErrLifecycleBusy) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			c.Error(apierror.ServiceUnavailable())
+			return
+		}
+		switch {
+		case errors.Is(err, connection.ErrAlreadyExists):
 			ce.publisher.Publish(quality.AppTopicConnectionEvents, cr.Event(quality.StageConnectionAlreadyExists, err.Error()))
 			c.Error(apierror.Unprocessable("Connection already exists", contract.ErrCodeConnectionAlreadyExists))
-		case connection.ErrConnectionCancelled:
+		case errors.Is(err, connection.ErrConnectionCancelled):
 			ce.publisher.Publish(quality.AppTopicConnectionEvents, cr.Event(quality.StageConnectionCanceled, err.Error()))
 			c.Error(apierror.Unprocessable("Connection cancelled", contract.ErrCodeConnectionCancelled))
 		default:
@@ -250,6 +260,10 @@ func (ce *ConnectionEndpoint) Create(c *gin.Context) {
 //	    description: Internal server error
 //	    schema:
 //	      "$ref": "#/definitions/APIError"
+//	  503:
+//	    description: Lifecycle busy or request cancelled
+//	    schema:
+//	      "$ref": "#/definitions/APIError"
 func (ce *ConnectionEndpoint) Kill(c *gin.Context) {
 	n := 0
 	id := c.Query("id")
@@ -262,11 +276,15 @@ func (ce *ConnectionEndpoint) Kill(c *gin.Context) {
 		}
 	}
 
-	err := ce.manager.Disconnect(n)
+	err := ce.manager.Disconnect(c.Request.Context(), n)
 	if err != nil {
-		switch err {
-		case connection.ErrNoConnection:
+		switch {
+		case errors.Is(err, connection.ErrNoConnection):
 			c.Error(apierror.Unprocessable("No connection exists", contract.ErrCodeNoConnectionExists))
+		case errors.Is(err, connection.ErrLifecycleBusy),
+			errors.Is(err, context.DeadlineExceeded),
+			errors.Is(err, context.Canceled):
+			c.Error(apierror.ServiceUnavailable())
 		default:
 			c.Error(apierror.Internal("Could not disconnect: "+err.Error(), contract.ErrCodeDisconnect))
 		}

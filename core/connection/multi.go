@@ -19,8 +19,9 @@ package connection
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/rs/zerolog/log"
@@ -29,187 +30,389 @@ import (
 	"github.com/mysteriumnetwork/node/identity"
 )
 
-// stripeCount is the fixed number of port-striped mutexes. Using a fixed
-// array avoids unbounded growth from arbitrary port values. 64 stripes
-// give low contention even under high parallelism.
-const stripeCount = 64
-
 type multiConnectionManager struct {
-	// mu protects the cms map only. Never held during Manager network calls.
-	mu  sync.Mutex
-	cms map[int]Manager
+	// mu protects all mutable state. Never held during Manager network calls.
+	mu sync.Mutex
 
-	// bulkMu serializes individual operations (RLock) against bulk disconnect
-	// (Lock). DisconnectAll acquires the write lock, which blocks until every
-	// in-flight Connect/Disconnect releases its read lock. This prevents a
-	// connected manager from escaping bulk cleanup.
-	bulkMu sync.RWMutex
+	// current entries by port — only connected/connecting/reconnecting managers.
+	current map[int]*portEntry
+	// retiring entries by port — managers being cleaned up. May coexist with
+	// a current entry on the same port (the current one is newer).
+	retiring map[int]*portEntry
 
-	// stripes serialize Connect and Disconnect for the same port. Fixed-size
-	// array: the stripe index is port % stripeCount. Two different ports that
-	// hash to the same stripe serialize against each other — acceptable for
-	// correctness, minor throughput cost.
-	stripes [stripeCount]sync.Mutex
+	generation        uint64
+	reconcileRequired bool
+
+	// activeBulk is the in-flight shared bulk operation, if any.
+	activeBulk *bulkOp
+
+	// notify is closed and replaced whenever state changes, so waiters
+	// can re-check without polling.
+	notify chan struct{}
+
+	// BulkTimeout is the hard deadline for authoritative bulk cleanup.
+	// Configurable for tests; default 30s.
+	BulkTimeout time.Duration
+
+	// dumpedGen tracks which generation already produced a goroutine dump.
+	dumpedGen uint64
 
 	newConnectionManager func() Manager
 }
 
-// NewMultiConnectionManager create a wrapper around connection manager to support multiple connections.
+// NewMultiConnectionManager creates a wrapper around connection manager
+// to support multiple connections with lifecycle coordination.
 func NewMultiConnectionManager(newConnectionManager func() Manager) *multiConnectionManager {
 	return &multiConnectionManager{
-		cms:                  make(map[int]Manager),
+		current:              make(map[int]*portEntry),
+		retiring:             make(map[int]*portEntry),
+		notify:               make(chan struct{}),
+		BulkTimeout:          30 * time.Second,
 		newConnectionManager: newConnectionManager,
 	}
 }
 
-func (mcm *multiConnectionManager) stripe(port int) *sync.Mutex {
-	idx := port % stripeCount
-	if idx < 0 {
-		idx += stripeCount
+// Connect creates a new connection on the given port.
+// The port is reserved atomically before creating the manager. The worker
+// owns finalization — cleanup waits for the operation to finish first.
+func (mcm *multiConnectionManager) Connect(ctx context.Context, consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) (retErr error) {
+	start := time.Now()
+	var opGen uint64 // captured at admission
+	defer func() {
+		log.Debug().Int("port", params.ProxyPort).Str("operation", "connect").
+			Uint64("generation", opGen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Connect finished")
+	}()
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
-	return &mcm.stripes[idx]
-}
 
-// Connect creates new connection from given consumer to provider.
-//
-// Lifecycle:
-//  1. Acquire bulk read lock (blocks during DisconnectAll).
-//  2. Acquire port stripe (serializes with Disconnect on the same port).
-//  3. Look up or create a Manager — do NOT publish to cms yet.
-//  4. Call Manager.Connect (network call, may block).
-//  5. On success: publish to cms. On failure of a new manager: discard.
-func (mcm *multiConnectionManager) Connect(consumerID identity.Identity, hermesID common.Address, proposalLookup ProposalLookup, params ConnectParams) error {
-	mcm.bulkMu.RLock()
-	defer mcm.bulkMu.RUnlock()
-
-	st := mcm.stripe(params.ProxyPort)
-	st.Lock()
-	defer st.Unlock()
-
+	// Reserve port atomically before creating manager
 	mcm.mu.Lock()
-	m, existed := mcm.cms[params.ProxyPort]
-	if !existed {
-		m = mcm.newConnectionManager()
+	if mcm.reconcileRequired {
+		mcm.mu.Unlock()
+		return ErrLifecycleBusy
+	}
+	if _, retiring := mcm.retiring[params.ProxyPort]; retiring {
+		mcm.mu.Unlock()
+		return ErrLifecycleBusy
+	}
+	if _, exists := mcm.current[params.ProxyPort]; exists {
+		mcm.mu.Unlock()
+		return ErrAlreadyExists
+	}
+	// Reserve with nil manager — filled after construction.
+	// Create coordinator-owned operation context derived from caller ctx.
+	opCtx, opCancel := context.WithCancel(ctx)
+	opDone := make(chan struct{})
+	entry := &portEntry{
+		port:          params.ProxyPort,
+		generation:    mcm.generation,
+		phase:         phaseConnecting,
+		operationDone: opDone,
+		opCancel:      opCancel,
+	}
+	mcm.current[params.ProxyPort] = entry
+	gen := mcm.generation
+	opGen = gen
+	mcm.stateChanged()
+	mcm.mu.Unlock()
+
+	// Create manager after reservation is held
+	m := mcm.newConnectionManager()
+	mcm.mu.Lock()
+	entry.manager = m
+	// Check if superseded during factory construction (bulk/ctx may have advanced)
+	if entry.phase == phaseRetiring || mcm.generation != gen || mcm.reconcileRequired || opCtx.Err() != nil {
+		entry.retire()
+		entry.opCancel = nil
+		if mcm.current[params.ProxyPort] == entry {
+			delete(mcm.current, params.ProxyPort)
+		}
+		mcm.retiring[params.ProxyPort] = entry
+		close(opDone)
+		mcm.stateChanged()
+		mcm.mu.Unlock()
+		opCancel()
+		go mcm.retireEntry(entry)
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
+		}
+		return fmt.Errorf("%w: %w: superseded during construction", ErrConnectionCancelled, ErrLifecycleBusy)
 	}
 	mcm.mu.Unlock()
 
-	err := m.Connect(consumerID, hermesID, proposalLookup, params)
-	if err == nil && !existed {
+	// resultErr is the error returned to the caller. Set by worker before
+	// closing opDone. Distinct from the raw connect error when superseded.
+	var resultErr error
+	go func() {
+		var connectErr error
+		if lm, ok := m.(lifecycleManager); ok {
+			connectErr = lm.ConnectContext(opCtx, consumerID, hermesID, proposalLookup, params)
+		} else {
+			connectErr = m.Connect(consumerID, hermesID, proposalLookup, params)
+		}
+
 		mcm.mu.Lock()
-		mcm.cms[params.ProxyPort] = m
+		entry.opCancel = nil // worker done — clear cancel
+
+		if entry.phase == phaseRetiring {
+			// Caller or bulk cancelled — we own cleanup
+			resultErr = fmt.Errorf("%w: %w", ErrConnectionCancelled, ErrLifecycleBusy)
+			close(opDone)
+			mcm.mu.Unlock()
+			mcm.retireEntry(entry)
+			return
+		}
+
+		if connectErr == nil && mcm.current[params.ProxyPort] == entry &&
+			mcm.generation == gen && !mcm.reconcileRequired && opCtx.Err() == nil {
+			entry.phase = phaseActive
+			resultErr = nil
+			close(opDone)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			return
+		}
+
+		// Failed, stale, or superseded — retire
+		if mcm.current[params.ProxyPort] == entry {
+			delete(mcm.current, params.ProxyPort)
+		}
+		entry.retire()
+		mcm.retiring[params.ProxyPort] = entry
+		if connectErr != nil {
+			resultErr = connectErr
+		} else {
+			resultErr = fmt.Errorf("%w: connect superseded", ErrLifecycleBusy)
+		}
+		close(opDone)
+		mcm.stateChanged()
 		mcm.mu.Unlock()
+		mcm.retireEntry(entry)
+	}()
+
+	select {
+	case <-opDone:
+		return resultErr
+	case <-ctx.Done():
+		mcm.mu.Lock()
+		// Worker may have already completed — check before retiring
+		if entry.phase == phaseActive {
+			// Worker already published success — linearize to success
+			mcm.mu.Unlock()
+			return nil
+		}
+		alreadyRetiring := entry.phase == phaseRetiring
+		if mcm.current[params.ProxyPort] == entry && entry.phase == phaseConnecting {
+			delete(mcm.current, params.ProxyPort)
+			entry.retire()
+			mcm.retiring[params.ProxyPort] = entry
+			mcm.stateChanged()
+		}
+		cancelFn := entry.opCancel
+		entry.opCancel = nil
+		mcm.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		mcm.cancelManager(m)
+		if alreadyRetiring {
+			return fmt.Errorf("%w: %w: %w", ErrConnectionCancelled, ErrLifecycleBusy, ctx.Err())
+		}
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
-	return err
 }
 
 // Status queries current status of connection.
+// Safe during any phase — manager.Status() uses its own statusLock.
 func (mcm *multiConnectionManager) Status(id int) connectionstate.Status {
 	mcm.mu.Lock()
-	m, ok := mcm.cms[id]
+	e, ok := mcm.current[id]
 	mcm.mu.Unlock()
-
-	if ok {
-		return m.Status()
+	if ok && e.manager != nil {
+		return e.manager.Status()
 	}
 	return connectionstate.Status{State: connectionstate.NotConnected}
 }
 
 // Stats provides connection statistics information.
+// Only returns stats from active entries — connecting/reconnecting managers
+// may not have initialized statsTracker yet (plan invariant 8).
 func (mcm *multiConnectionManager) Stats(id int) connectionstate.Statistics {
 	mcm.mu.Lock()
-	m, ok := mcm.cms[id]
+	e, ok := mcm.current[id]
+	var m Manager
+	if ok && e.phase == phaseActive && e.manager != nil {
+		m = e.manager
+	}
 	mcm.mu.Unlock()
-
-	if ok {
+	if m != nil {
 		return m.Stats()
 	}
 	return connectionstate.Statistics{}
 }
 
-// Disconnect closes established connection and removes it from the registry.
-// id < 0 disconnects all managers atomically.
-//
-// Lifecycle:
-//  1. Acquire bulk read lock.
-//  2. Acquire port stripe (waits for in-flight Connect on same port).
-//  3. Remove the exact manager from cms.
-//  4. Call Manager.Disconnect (network call).
-func (mcm *multiConnectionManager) Disconnect(id int) error {
+// Disconnect closes an established connection. id < 0 triggers authoritative
+// bulk cleanup. Returns nil only after cleanup completes successfully.
+func (mcm *multiConnectionManager) Disconnect(ctx context.Context, id int) (retErr error) {
 	if id < 0 {
-		return mcm.disconnectAll()
+		return mcm.disconnectAll(ctx)
 	}
-
-	mcm.bulkMu.RLock()
-	defer mcm.bulkMu.RUnlock()
-
-	// Always acquire stripe — serializes with in-flight Connect on this port.
-	// Without this, Disconnect could see an empty cms entry, return early,
-	// while Connect is about to publish and become orphaned.
-	st := mcm.stripe(id)
-	st.Lock()
-	defer st.Unlock()
+	start := time.Now()
+	var opGen uint64
+	defer func() {
+		log.Debug().Int("port", id).Str("operation", "disconnect").
+			Uint64("generation", opGen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Disconnect finished")
+	}()
 
 	mcm.mu.Lock()
-	m, ok := mcm.cms[id]
-	mcm.mu.Unlock()
-
+	opGen = mcm.generation
+	e, ok := mcm.current[id]
 	if !ok {
-		return nil
-	}
-
-	err := m.Disconnect()
-
-	// Remove after cleanup — not before
-	mcm.mu.Lock()
-	if mcm.cms[id] == m {
-		delete(mcm.cms, id)
-	}
-	mcm.mu.Unlock()
-
-	if errors.Is(err, ErrNoConnection) {
-		return nil
-	}
-	return err
-}
-
-// disconnectAll acquires the bulk write lock, which blocks until all
-// in-flight Connect/Disconnect calls release their read locks. Then it
-// atomically detaches the entire registry and disconnects every manager.
-// Managers published by Connect calls that start after the write lock
-// is held will go into the fresh empty registry.
-func (mcm *multiConnectionManager) disconnectAll() error {
-	mcm.bulkMu.Lock()
-	defer mcm.bulkMu.Unlock()
-
-	mcm.mu.Lock()
-	old := mcm.cms
-	mcm.cms = make(map[int]Manager)
-	mcm.mu.Unlock()
-
-	var errs []error
-	for _, m := range old {
-		if err := m.Disconnect(); err != nil && !errors.Is(err, ErrNoConnection) {
-			log.Error().Err(err).Msg("Failed to disconnect active connection")
-			errs = append(errs, err)
+		// Check if already retiring
+		if re, rok := mcm.retiring[id]; rok {
+			mcm.mu.Unlock()
+			return mcm.waitRetirement(ctx, re)
 		}
+		mcm.mu.Unlock()
+		return nil
 	}
-	return errors.Join(errs...)
-}
 
-// CheckChannel checks if current session channel is alive, returns error on failed keep-alive ping.
-func (mcm *multiConnectionManager) CheckChannel(context.Context) error { return nil }
-
-// Reconnect reconnects current session. Holds bulkMu to prevent
-// disconnectAll from racing the reconnect cycle.
-func (mcm *multiConnectionManager) Reconnect(id int) {
-	mcm.bulkMu.RLock()
-	defer mcm.bulkMu.RUnlock()
-
-	mcm.mu.Lock()
-	m, ok := mcm.cms[id]
+	delete(mcm.current, id)
+	e.retire()
+	mcm.retiring[id] = e
+	cancelFn := e.opCancel
+	e.opCancel = nil
+	mcm.stateChanged()
 	mcm.mu.Unlock()
 
-	if ok {
-		m.Reconnect()
+	// Cancel coordinator-owned operation context + manager
+	if cancelFn != nil {
+		cancelFn()
+	}
+	mcm.cancelManager(e.manager)
+
+	return mcm.waitRetirement(ctx, e)
+}
+
+// Reconnect disconnects and reconnects on the given port.
+// Uses the same worker-owned pattern as Connect: new operationDone,
+// ctx select, cleanup waits for operation completion.
+func (mcm *multiConnectionManager) Reconnect(ctx context.Context, id int) (retErr error) {
+	start := time.Now()
+	var opGen uint64
+	defer func() {
+		log.Debug().Int("port", id).Str("operation", "reconnect").
+			Uint64("generation", opGen).Err(retErr).
+			Dur("elapsed", time.Since(start)).Msg("Reconnect finished")
+	}()
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
+	}
+
+	mcm.mu.Lock()
+	opGen = mcm.generation
+	if mcm.reconcileRequired {
+		mcm.mu.Unlock()
+		return ErrLifecycleBusy
+	}
+	e, ok := mcm.current[id]
+	if !ok {
+		if _, retiring := mcm.retiring[id]; retiring {
+			mcm.mu.Unlock()
+			return ErrLifecycleBusy
+		}
+		mcm.mu.Unlock()
+		return ErrNoConnection
+	}
+	if e.manager == nil || e.phase == phaseReconnecting || e.phase == phaseConnecting {
+		mcm.mu.Unlock()
+		return ErrLifecycleBusy
+	}
+	gen := mcm.generation
+	m := e.manager
+	e.phase = phaseReconnecting
+	// Coordinator-owned operation context for this reconnect
+	opCtx, opCancel := context.WithCancel(ctx)
+	opDone := make(chan struct{})
+	e.operationDone = opDone
+	e.opCancel = opCancel
+	mcm.stateChanged()
+	mcm.mu.Unlock()
+
+	var resultErr error
+	go func() {
+		var reconErr error
+		if lm, ok := m.(lifecycleManager); ok {
+			reconErr = lm.ReconnectContext(opCtx)
+		} else {
+			m.Reconnect()
+		}
+
+		mcm.mu.Lock()
+		e.opCancel = nil // worker done — clear cancel
+
+		if e.phase == phaseRetiring {
+			resultErr = fmt.Errorf("%w: %w", ErrConnectionCancelled, ErrLifecycleBusy)
+			close(opDone)
+			mcm.mu.Unlock()
+			mcm.retireEntry(e)
+			return
+		}
+
+		if reconErr == nil && mcm.generation == gen && !mcm.reconcileRequired && opCtx.Err() == nil {
+			e.phase = phaseActive
+			resultErr = nil
+			close(opDone)
+			mcm.stateChanged()
+			mcm.mu.Unlock()
+			return
+		}
+
+		// Failed, superseded, or stale — retire
+		if mcm.current[id] == e {
+			delete(mcm.current, id)
+		}
+		e.retire()
+		mcm.retiring[id] = e
+		if reconErr != nil {
+			resultErr = reconErr
+		} else {
+			resultErr = ErrLifecycleBusy
+		}
+		close(opDone)
+		mcm.stateChanged()
+		mcm.mu.Unlock()
+		mcm.retireEntry(e)
+	}()
+
+	select {
+	case <-opDone:
+		return resultErr
+	case <-ctx.Done():
+		mcm.mu.Lock()
+		if e.phase == phaseActive {
+			mcm.mu.Unlock()
+			return nil
+		}
+		if mcm.current[id] == e && e.phase == phaseReconnecting {
+			delete(mcm.current, id)
+			e.retire()
+			mcm.retiring[id] = e
+			mcm.stateChanged()
+		}
+		cancelFn := e.opCancel
+		e.opCancel = nil
+		mcm.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		mcm.cancelManager(m)
+		return fmt.Errorf("%w: %w", ErrConnectionCancelled, ctx.Err())
 	}
 }
+
+// CheckChannel checks if current session channel is alive.
+func (mcm *multiConnectionManager) CheckChannel(ctx context.Context) error { return nil }
