@@ -35,16 +35,24 @@ import (
 // --- Mock manager ---
 
 type mockManager struct {
-	mu            sync.Mutex
-	connected     bool
-	connectGate   chan struct{} // if set, Connect blocks until closed
-	connectErr    error
-	disconnectErr error
-	connectCount  atomic.Int32
-	disconnCount  atomic.Int32
+	mu             sync.Mutex
+	connected      bool
+	connectGate    chan struct{} // if set, Connect blocks until closed
+	connectEntered chan struct{} // if set, closed when Connect enters (before gate)
+	connectErr     error
+	disconnectErr  error
+	connectCount   atomic.Int32
+	disconnCount   atomic.Int32
 }
 
 func (m *mockManager) Connect(_ identity.Identity, _ common.Address, _ ProposalLookup, _ ConnectParams) error {
+	if m.connectEntered != nil {
+		select {
+		case <-m.connectEntered:
+		default:
+			close(m.connectEntered)
+		}
+	}
 	if m.connectGate != nil {
 		<-m.connectGate
 	}
@@ -384,11 +392,15 @@ func TestBulkSingleFlight(t *testing.T) {
 
 func TestTwoUnrelatedPortsConcurrent(t *testing.T) {
 	gate := make(chan struct{})
-	entered := make(chan struct{}, 2)
+	entered1 := make(chan struct{})
+	entered2 := make(chan struct{})
+	var callNum atomic.Int32
 	mcm := NewMultiConnectionManager(func() Manager {
-		m := &mockManager{connectGate: gate}
-		entered <- struct{}{}
-		return m
+		n := callNum.Add(1)
+		if n == 1 {
+			return &mockManager{connectGate: gate, connectEntered: entered1}
+		}
+		return &mockManager{connectGate: gate, connectEntered: entered2}
 	})
 
 	var wg sync.WaitGroup
@@ -402,16 +414,16 @@ func TestTwoUnrelatedPortsConcurrent(t *testing.T) {
 		mcm.Connect(bg(), dummyID(), dummyHermes(), dummyLookup(), dummyParams(200))
 	}()
 
-	// Both managers must be created before release — proves concurrency
+	// Both Manager.Connect must be entered before release — proves no serialization
 	select {
-	case <-entered:
+	case <-entered1:
 	case <-time.After(5 * time.Second):
-		t.Fatal("first manager not created")
+		t.Fatal("first Connect not entered")
 	}
 	select {
-	case <-entered:
+	case <-entered2:
 	case <-time.After(5 * time.Second):
-		t.Fatal("second manager not created")
+		t.Fatal("second Connect not entered")
 	}
 	close(gate)
 	wg.Wait()
