@@ -43,6 +43,9 @@ var (
 	// ErrSendTimeout indicates send timeout error.
 	ErrSendTimeout = errors.New("p2p send timeout")
 
+	// ErrChannelClosed indicates that the channel was closed while a request was being sent.
+	ErrChannelClosed = errors.New("p2p channel closed")
+
 	// ErrHandlerNotFound indicates that peer is not registered handler yet.
 	ErrHandlerNotFound = errors.New("p2p peer handler not found")
 )
@@ -422,7 +425,7 @@ func (c *channel) handleRequest(msg *transportMsg) {
 		errMsg := fmt.Sprintf("handler %q not found", msg.topic)
 		log.Err(errors.New(errMsg))
 		resMsg.data = []byte(errMsg)
-		c.sendQueue <- &resMsg
+		c.queueReply(&resMsg)
 		return
 	}
 
@@ -447,7 +450,16 @@ func (c *channel) handleRequest(msg *transportMsg) {
 			resMsg.data = ctx.res.Data
 		}
 	}
-	c.sendQueue <- &resMsg
+	c.queueReply(&resMsg)
+}
+
+// queueReply hands a reply to the send loop. It gives up once the channel is
+// stopped instead of blocking forever on a queue nobody drains.
+func (c *channel) queueReply(msg *transportMsg) {
+	select {
+	case c.sendQueue <- msg:
+	case <-c.stop:
+	}
 }
 
 // Tracer returns tracer which tracks channel establishment
@@ -534,8 +546,15 @@ func (c *channel) sendRequest(ctx context.Context, topic string, m *Message) (*M
 	s := c.addStream()
 	defer c.deleteStream(s.id)
 
-	// Send request.
-	c.sendQueue <- &transportMsg{id: s.id, topic: topic, data: m.Data}
+	// Send request. The queue stays full while the send loop is blocked on a
+	// dead peer, so queueing must honour ctx and channel stop as well.
+	select {
+	case c.sendQueue <- &transportMsg{id: s.id, topic: topic, data: m.Data}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("timeout queueing request to %q: %w", topic, ErrSendTimeout)
+	case <-c.stop:
+		return nil, fmt.Errorf("could not queue request to %q: %w", topic, ErrChannelClosed)
+	}
 
 	// Wait for response.
 	select {
