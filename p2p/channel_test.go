@@ -359,3 +359,69 @@ func acquirePorts(n int) ([]int, error) {
 	}
 	return res, nil
 }
+
+// blockingWireWriter never returns from writeMsg until released. It simulates
+// the send loop stuck inside a kcp write on a peer that stopped acknowledging.
+type blockingWireWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWireWriter) writeMsg(*transportMsg) error {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return nil
+}
+
+// Regression for the 2026-09-09 outage: with the send loop stuck on a dead
+// peer the send queue filled up and every Send blocked forever on the queue,
+// ignoring its context, so connection cleanup never finished.
+func TestChannel_Send_HonoursContextWhenSendQueueFull(t *testing.T) {
+	writer := &blockingWireWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(writer.release)
+	c := &channel{
+		tr:            &transport{wireWriter: writer},
+		topicHandlers: make(map[string]HandlerFunc),
+		streams:       make(map[uint64]*stream),
+		stop:          make(chan struct{}, 1),
+		sendQueue:     make(chan *transportMsg, 2),
+	}
+	go c.localSendLoop(c.tr)
+
+	// The send loop takes the first message and blocks inside the writer.
+	c.sendQueue <- &transportMsg{}
+	<-writer.entered
+	// Fill the remaining queue capacity.
+	for i := 0; i < cap(c.sendQueue); i++ {
+		c.sendQueue <- &transportMsg{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Send(ctx, "stuck", &Message{Data: []byte("ping")})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrSendTimeout)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send blocked on a full send queue instead of honouring ctx")
+	}
+
+	// A stopped channel must release senders too.
+	close(c.stop)
+	done = make(chan error, 1)
+	go func() {
+		_, err := c.Send(context.Background(), "stuck", &Message{Data: []byte("ping")})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrChannelClosed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send blocked on a stopped channel")
+	}
+}
